@@ -1,0 +1,34 @@
+# Secure Sandbox for Agent Execution
+# Protocol: 1 (Container-First Sandbox)
+# This container is the ONLY place where agents can execute code.
+
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install essential build tools and generic languages
+# Supporting: C++, Python, generic utils
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    python3 \
+    python3-pip \
+    python3-venv \
+    curl \
+    wget \
+    jq \
+    vim \
+    net-tools \
+    iputils-ping \
+    # Clean up to keep image small
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up a non-root user for safer execution (optional, but good practice)
+# However, agents often need to install things, so we'll start as root 
+# and potentially switch later if we add strict permissions.
+WORKDIR /workspace
+
+# Default command keeps the container running
+CMD ["tail", "-f", "/dev/null"]

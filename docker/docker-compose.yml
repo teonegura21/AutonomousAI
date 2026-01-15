@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  # The Brain (Executed by your host python script potentially)
+  # But if we containerize the controller too:
+  # controller: ...
+
+  # The Hand (Where code runs)
+  sandbox:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.sandbox
+    container_name: agent_sandbox
+    volumes:
+      # Mount a shared workspace so the Controller (Host) can read what the Agent (Container) writes
+      - ../workspace_data:/workspace
+    network_mode: bridge
+    # Limits for safety
+    mem_limit: 4g
+    cpus: 2.0
