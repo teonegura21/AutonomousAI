@@ -1,0 +1,40 @@
+# Node.js Tools Container
+# For JavaScript/TypeScript execution and npm packages
+
+FROM node:20-slim
+
+LABEL maintainer="AI_Autonom"
+LABEL description="Node.js sandbox for JavaScript execution"
+
+ENV NODE_ENV=development
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install global npm packages
+RUN npm install -g \
+    typescript \
+    ts-node \
+    eslint \
+    prettier \
+    jest \
+    mocha \
+    npm-check-updates \
+    yarn \
+    pnpm \
+    http-server \
+    nodemon \
+    concurrently
+
+WORKDIR /workspace
+RUN useradd -m -s /bin/bash -u 1000 nodeuser && \
+    chown -R nodeuser:nodeuser /workspace
+
+USER nodeuser
+
+CMD ["bash"]

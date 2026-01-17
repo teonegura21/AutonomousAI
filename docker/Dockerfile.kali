@@ -1,0 +1,226 @@
+# AI Autonom Kali Linux Security Container
+# Full-featured Kali Linux for security tool execution
+# Includes web terminal for live visibility
+
+FROM kalilinux/kali-rolling:latest
+
+LABEL maintainer="AI_Autonom"
+LABEL description="Kali Linux security sandbox with web terminal"
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Update and install base tools
+RUN apt-get update && apt-get -y upgrade && apt-get install -y \
+    # Locale setup
+    locales \
+    && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen \
+    && locale-gen en_US.UTF-8
+
+# ============================================
+# KALI METAPACKAGES - Security Tool Categories
+# ============================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Core tools
+    kali-linux-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================
+# ESSENTIAL SECURITY TOOLS
+# ============================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Reconnaissance & Information Gathering
+    nmap \
+    masscan \
+    dnsenum \
+    dnsrecon \
+    whois \
+    theharvester \
+    recon-ng \
+    amass \
+    # Web Application Testing
+    nikto \
+    dirb \
+    gobuster \
+    whatweb \
+    wpscan \
+    sqlmap \
+    # Network Analysis
+    wireshark-common \
+    tshark \
+    tcpdump \
+    netcat-openbsd \
+    socat \
+    ncat \
+    hping3 \
+    # Password & Hash
+    john \
+    hashcat \
+    hydra \
+    # Exploitation
+    metasploit-framework \
+    exploitdb \
+    # Note: searchsploit is included in exploitdb package
+    # Reverse Engineering
+    binwalk \
+    radare2 \
+    gdb \
+    gdb-peda \
+    ltrace \
+    strace \
+    # Forensics (volatility3 installed via pip)
+    foremost \
+    autopsy \
+    sleuthkit \
+    libimage-exiftool-perl \
+    # Wireless (limited in container)
+    aircrack-ng \
+    # Misc Tools
+    curl \
+    wget \
+    git \
+    sshpass \
+    vim \
+    tmux \
+    screen \
+    jq \
+    tree \
+    htop \
+    xxd \
+    hexedit \
+    file \
+    binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================
+# PYTHON ENVIRONMENT
+# ============================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python security tools
+RUN pip3 install --no-cache-dir --break-system-packages \
+    # Web testing
+    requests \
+    httpx \
+    aiohttp \
+    beautifulsoup4 \
+    lxml \
+    pwntools \
+    # Security analysis
+    bandit \
+    safety \
+    # Data processing
+    pandas \
+    numpy \
+    # CLI tools
+    rich \
+    typer \
+    # API clients
+    shodan \
+    censys \
+    # Forensics
+    volatility3 \
+    yara-python \
+    # Utilities
+    pyyaml \
+    python-dotenv \
+    paramiko \
+    loguru
+
+# ============================================
+# WEB TERMINAL (ttyd) FOR VISIBILITY
+# ============================================
+# ttyd not available in Kali repos - install from GitHub releases
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget -q https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd \
+    && chmod +x /usr/local/bin/ttyd || echo "ttyd install failed, web terminal disabled"
+
+# ============================================
+# WORKSPACE SETUP
+# ============================================
+WORKDIR /workspace
+
+# Create directories
+RUN mkdir -p /workspace /outputs /tools /logs /findings \
+    && chmod 777 /workspace /outputs /tools /logs /findings
+
+# Copy tool wrapper scripts
+COPY docker/tools/kali/ /tools/
+
+# ============================================
+# LOGGING & VISIBILITY
+# ============================================
+# Create logging script
+RUN echo '#!/bin/bash\n\
+# Log all commands to /logs/commands.log\n\
+export PROMPT_COMMAND='\''echo "$(date "+%Y-%m-%d %H:%M:%S") [$$] $(whoami)@$(hostname): $(history 1)" >> /logs/commands.log'\''' > /etc/profile.d/logging.sh \
+    && chmod +x /etc/profile.d/logging.sh
+
+# Create status endpoint script
+RUN echo '#!/usr/bin/env python3\n\
+import json\n\
+import subprocess\n\
+import os\n\
+from datetime import datetime\n\
+\n\
+def get_status():\n\
+    return {\n\
+        "timestamp": datetime.now().isoformat(),\n\
+        "hostname": os.uname().nodename,\n\
+        "uptime": subprocess.getoutput("uptime -p"),\n\
+        "processes": len(subprocess.getoutput("ps aux").split("\\n")) - 1,\n\
+        "memory": subprocess.getoutput("free -h | grep Mem | awk '\\''{print $3\"/\"$2}'\\''")\n\
+    }\n\
+\n\
+if __name__ == "__main__":\n\
+    print(json.dumps(get_status(), indent=2))\n\
+' > /tools/status.py && chmod +x /tools/status.py
+
+# ============================================
+# ENTRYPOINT
+# ============================================
+# Startup script that runs web terminal + keeps container alive
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+# Initialize logs\n\
+touch /logs/commands.log /logs/output.log\n\
+echo "[$(date)] Kali container started" >> /logs/commands.log\n\
+\n\
+# Start ttyd web terminal on port 7681 (if available)\n\
+if command -v ttyd &> /dev/null; then\n\
+    ttyd -p 7681 -W bash &\n\
+    echo "[$(date)] Web terminal started on port 7681" >> /logs/commands.log\n\
+else\n\
+    echo "[$(date)] ttyd not available, web terminal disabled" >> /logs/commands.log\n\
+fi\n\
+\n\
+# Keep container running\n\
+tail -f /logs/commands.log\n\
+' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+# Set path
+ENV PATH="/tools:${PATH}"
+ENV PYTHONPATH="/workspace:/tools"
+
+# Expose web terminal port
+EXPOSE 7681
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:7681/ || exit 1
+
+# Start with entrypoint
+CMD ["/entrypoint.sh"]

@@ -1,20 +1,279 @@
 version: '3.8'
 
-services:
-  # The Brain (Executed by your host python script potentially)
-  # But if we containerize the controller too:
-  # controller: ...
+# AI Autonom Multi-Agent System
+# Complete Docker infrastructure for agent tool execution
+# Kali Linux is the default security execution environment
 
-  # The Hand (Where code runs)
+services:
+  # ============================================
+  # KALI LINUX - Primary Security Execution Environment
+  # ============================================
+  kali:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.kali
+    container_name: agent_kali
+    hostname: kali
+    volumes:
+      - kali_workspace:/workspace
+      - ../outputs:/outputs
+      - kali_logs:/logs
+      - kali_findings:/findings
+    mem_limit: 4g
+    cpus: 4.0
+    ports:
+      - "7681:7681"  # Web terminal for visibility
+    networks:
+      - agent_network
+    security_opt:
+      - seccomp:unconfined  # Required for some security tools
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7681/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      - "ai.autonom.role=kali"
+      - "ai.autonom.tools=nmap,metasploit,sqlmap,binwalk,volatility,wireshark"
+      - "ai.autonom.primary=true"
+
+  # ============================================
+  # MAIN SANDBOX - General purpose Python execution
+  # ============================================
   sandbox:
     build:
       context: ../
       dockerfile: docker/Dockerfile.sandbox
     container_name: agent_sandbox
+    hostname: sandbox
     volumes:
-      # Mount a shared workspace so the Controller (Host) can read what the Agent (Container) writes
-      - ../workspace_data:/workspace
-    network_mode: bridge
-    # Limits for safety
-    mem_limit: 4g
+      - agent_workspace:/workspace
+      - ../outputs:/outputs
+      - ../src/tools:/tools:ro
+    mem_limit: 2g
     cpus: 2.0
+    networks:
+      - agent_network
+    security_opt:
+      - no-new-privileges:true
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      - "ai.autonom.role=sandbox"
+      - "ai.autonom.tools=python,bash,filesystem"
+
+  # ============================================
+  # SECURITY SANDBOX - Defensive analysis tools
+  # ============================================
+  security:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.security
+    container_name: agent_security
+    hostname: security
+    volumes:
+      - security_workspace:/analysis
+      - ../outputs:/outputs:ro
+    mem_limit: 1g
+    cpus: 1.0
+    networks:
+      - agent_network
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M,mode=1777
+    restart: unless-stopped
+    labels:
+      - "ai.autonom.role=security"
+      - "ai.autonom.tools=bandit,safety,nmap,analysis"
+
+  # ============================================
+  # WEB SANDBOX - Web scraping & automation
+  # ============================================
+  web:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.web
+    container_name: agent_web
+    hostname: web
+    volumes:
+      - web_workspace:/web
+      - ../outputs:/outputs
+    mem_limit: 3g
+    cpus: 2.0
+    shm_size: 1g  # For browser automation
+    networks:
+      - agent_network
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    labels:
+      - "ai.autonom.role=web"
+      - "ai.autonom.tools=selenium,playwright,requests,scraping"
+
+  # ============================================
+  # NODE.JS SANDBOX - JavaScript/TypeScript execution
+  # ============================================
+  nodejs:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.node
+    container_name: agent_nodejs
+    hostname: nodejs
+    volumes:
+      - node_workspace:/workspace
+      - ../outputs:/outputs
+    mem_limit: 1g
+    cpus: 1.0
+    networks:
+      - agent_network
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    labels:
+      - "ai.autonom.role=nodejs"
+      - "ai.autonom.tools=npm,typescript,eslint,jest"
+
+  # ============================================
+  # DATABASES
+  # ============================================
+  
+  # ChromaDB - Vector database for semantic search
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: agent_chromadb
+    hostname: chromadb
+    volumes:
+      - chromadb_data:/chroma/chroma
+    ports:
+      - "8000:8000"
+    networks:
+      - agent_network
+    environment:
+      - ANONYMIZED_TELEMETRY=false
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      - "ai.autonom.role=database"
+      - "ai.autonom.tools=vector_search,embeddings"
+
+  # Redis - For caching and message queues
+  redis:
+    image: redis:7-alpine
+    container_name: agent_redis
+    hostname: redis
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - agent_network
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      - "ai.autonom.role=cache"
+      - "ai.autonom.tools=cache,pubsub,queue"
+
+  # ============================================
+  # MONITORING & INFRASTRUCTURE
+  # ============================================
+  
+  # Portainer - Container management UI
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: agent_portainer
+    hostname: portainer
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - portainer_data:/data
+    ports:
+      - "9000:9000"
+    networks:
+      - agent_network
+    restart: unless-stopped
+    labels:
+      - "ai.autonom.role=monitoring"
+
+  # ============================================
+  # TOOL PROXY - API gateway for tools
+  # ============================================
+  tool-proxy:
+    image: nginx:alpine
+    container_name: agent_tool_proxy
+    hostname: tool-proxy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/tools.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
+    networks:
+      - agent_network
+    depends_on:
+      - sandbox
+      - chromadb
+      - redis
+    restart: unless-stopped
+    labels:
+      - "ai.autonom.role=proxy"
+
+# ============================================
+# VOLUMES
+# ============================================
+volumes:
+  # Kali Linux volumes
+  kali_workspace:
+    name: ai_autonom_kali_workspace
+  kali_logs:
+    name: ai_autonom_kali_logs
+  kali_findings:
+    name: ai_autonom_kali_findings
+  # Other volumes
+  agent_workspace:
+    name: ai_autonom_workspace
+  security_workspace:
+    name: ai_autonom_security
+  web_workspace:
+    name: ai_autonom_web
+  node_workspace:
+    name: ai_autonom_node
+  chromadb_data:
+    name: ai_autonom_chromadb
+  redis_data:
+    name: ai_autonom_redis
+  portainer_data:
+    name: ai_autonom_portainer
+
+# ============================================
+# NETWORKS
+# ============================================
+networks:
+  agent_network:
+    name: ai_autonom_network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

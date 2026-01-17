@@ -1,0 +1,66 @@
+# Security Analysis Container
+# Tools for defensive security analysis - READ ONLY operations
+
+FROM python:3.11-slim
+
+LABEL maintainer="AI_Autonom"
+LABEL description="Security analysis sandbox - defensive tools only"
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
+# Install security analysis tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Network analysis
+    nmap \
+    netcat-openbsd \
+    tcpdump \
+    tshark \
+    # File analysis
+    binutils \
+    file \
+    xxd \
+    hexdump \
+    # SSL/TLS
+    openssl \
+    ca-certificates \
+    # Text tools
+    jq \
+    # Build tools
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python security packages
+RUN pip install --no-cache-dir \
+    # Static analysis
+    bandit \
+    safety \
+    semgrep \
+    # Dependency scanning
+    pip-audit \
+    # Cryptography
+    cryptography \
+    pycryptodome \
+    # Network analysis
+    scapy \
+    dnspython \
+    # Hash tools
+    hashlib \
+    # File analysis
+    python-magic \
+    pefile \
+    # YAML/JSON
+    pyyaml \
+    # HTTP
+    requests \
+    httpx
+
+WORKDIR /analysis
+RUN useradd -m -s /bin/bash -u 1000 analyst && \
+    chown -R analyst:analyst /analysis
+
+USER analyst
+
+# Read-only mode by default
+CMD ["bash"]

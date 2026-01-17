@@ -1,0 +1,83 @@
+# Web Tools Container
+# For web scraping, API testing, and browser automation
+
+FROM python:3.11-slim
+
+LABEL maintainer="AI_Autonom"
+LABEL description="Web tools sandbox for scraping and API testing"
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/browsers
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    wget \
+    ca-certificates \
+    chromium \
+    chromium-driver \
+    firefox-esr \
+    fonts-liberation \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python web packages
+RUN pip install --no-cache-dir \
+    # HTTP clients
+    requests \
+    httpx \
+    aiohttp \
+    urllib3 \
+    # Web scraping
+    beautifulsoup4 \
+    lxml \
+    selectolax \
+    parsel \
+    # Browser automation
+    selenium \
+    playwright \
+    pyppeteer \
+    # API testing
+    pytest \
+    pytest-asyncio \
+    respx \
+    # HTML parsing
+    html5lib \
+    cssselect \
+    # JSON/XML
+    pyyaml \
+    xmltodict \
+    # Rate limiting
+    ratelimit \
+    tenacity \
+    # Utilities
+    fake-useragent \
+    python-dotenv \
+    rich \
+    tqdm
+
+# Install playwright browsers
+RUN playwright install chromium firefox
+
+WORKDIR /web
+RUN useradd -m -s /bin/bash -u 1000 webuser && \
+    chown -R webuser:webuser /web /browsers
+
+USER webuser
+
+CMD ["bash"]

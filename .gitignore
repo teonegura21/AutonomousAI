@@ -1,0 +1,48 @@
+# Python
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.env
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+chroma_data/
+vector_db/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+workspace_data/
+
+# Runtime data
+.runtime/
+
+# Logs
+*.log
+logs/
+
+# Test outputs
+.pytest_cache/
+htmlcov/
+.coverage
+
+.cai/
+cai/

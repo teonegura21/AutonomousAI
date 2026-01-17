@@ -1,0 +1,29 @@
+# Core Orchestration
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+
+# Database & Memory
+chromadb>=0.4.0
+# sqlite3 is built-in with Python
+
+# Ollama Integration
+ollama>=0.4.0
+requests>=2.31.0
+
+# Agent Framework (Microsoft)
+# Note: Install when available or use alternative like autogen
+# microsoft-agents
+
+# Model Context Protocol (MCP)
+# Note: MCP client to be added when official package available
+# For now, we'll use direct API calls
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pyyaml>=6.0.0
+
+# Development
+pytest>=8.0.0
+black>=24.0.0

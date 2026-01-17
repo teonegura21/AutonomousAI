@@ -1,34 +1,140 @@
-# Secure Sandbox for Agent Execution
-# Protocol: 1 (Container-First Sandbox)
-# This container is the ONLY place where agents can execute code.
+# AI Autonom Enhanced Sandbox Container
+# Full-featured isolated environment for agent code execution
+# All tools available to agents for task completion
 
-FROM ubuntu:24.04
+FROM python:3.11-slim
 
-# Prevent interactive prompts during package installation
+LABEL maintainer="AI_Autonom"
+LABEL description="Enhanced sandbox for multi-agent AI system"
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install essential build tools and generic languages
-# Supporting: C++, Python, generic utils
-RUN apt-get update && apt-get install -y \
-    build-essential \
+# Install system dependencies and development tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build tools
+    gcc \
+    g++ \
+    make \
     cmake \
+    # Version control
     git \
-    python3 \
-    python3-pip \
-    python3-venv \
+    # Network tools
     curl \
     wget \
-    jq \
-    vim \
-    net-tools \
+    netcat-openbsd \
+    dnsutils \
     iputils-ping \
-    # Clean up to keep image small
-    && rm -rf /var/lib/apt/lists/*
+    # Text processing
+    jq \
+    vim-tiny \
+    # Archive tools
+    zip \
+    unzip \
+    # Process tools
+    procps \
+    htop \
+    # File tools
+    tree \
+    less \
+    # SQLite
+    sqlite3 \
+    # SSL/TLS
+    ca-certificates \
+    openssl \
+    # Locales
+    locales \
+    && rm -rf /var/lib/apt/lists/* \
+    && locale-gen en_US.UTF-8
 
-# Set up a non-root user for safer execution (optional, but good practice)
-# However, agents often need to install things, so we'll start as root 
-# and potentially switch later if we add strict permissions.
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+# Install comprehensive Python packages for agent tasks
+RUN pip install --no-cache-dir \
+    # Web & HTTP
+    requests \
+    httpx \
+    aiohttp \
+    beautifulsoup4 \
+    lxml \
+    selenium \
+    playwright \
+    # Data processing
+    pandas \
+    numpy \
+    polars \
+    # Testing
+    pytest \
+    pytest-cov \
+    pytest-asyncio \
+    hypothesis \
+    # CLI & formatting
+    rich \
+    click \
+    typer \
+    tabulate \
+    # Config & serialization
+    pyyaml \
+    toml \
+    python-dotenv \
+    pydantic \
+    # Database
+    sqlalchemy \
+    aiosqlite \
+    # Async
+    asyncio \
+    anyio \
+    # Text processing
+    regex \
+    chardet \
+    # File handling
+    pathlib2 \
+    watchdog \
+    # Security analysis (read-only)
+    bandit \
+    safety \
+    # Code quality
+    black \
+    isort \
+    flake8 \
+    pylint \
+    mypy \
+    # Documentation
+    sphinx \
+    mkdocs \
+    # API development
+    fastapi \
+    uvicorn \
+    # Utilities
+    tqdm \
+    loguru \
+    arrow \
+    humanize
+
+# Create workspace and output directories
 WORKDIR /workspace
+RUN mkdir -p /workspace /outputs /tools /tmp/agent
 
-# Default command keeps the container running
+# Create non-root user for security
+RUN useradd -m -s /bin/bash -u 1000 agent && \
+    chown -R agent:agent /workspace /outputs /tools /tmp/agent
+
+# Copy tool scripts (will be mounted in production)
+COPY --chown=agent:agent docker/tools/ /tools/
+
+# Switch to non-root user
+USER agent
+
+# Set Python path
+ENV PYTHONPATH=/workspace:/tools
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "print('healthy')" || exit 1
+
+# Default command - keep container running
 CMD ["tail", "-f", "/dev/null"]
