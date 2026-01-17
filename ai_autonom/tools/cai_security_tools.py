@@ -104,7 +104,7 @@ class CaiSecurityTools:
         dangerous_patterns = [
             r"(?i)rm\s+-rf\s+/", r"(?i):(){ :|:& };:", r"(?i)curl.*\|.*sh",
             r"(?i)wget.*\|.*bash", r"(?i)nc\s+[\d\.]+\s+\d+.*-e",
-            r"(?i)bash.*-i.*>&.*tcp/", r"(?i)/dev/tcp/[\d\.]+/".strip() + "\d+",
+            r"(?i)bash.*-i.*>&.*tcp/", r"(?i)/dev/tcp/[\d\.]+/".strip() + r"\d+",
             r"(?i)mkfs", r"(?i)dd\s+if=", r"(?i)chmod\s+-R\s+777\s+/"
         ]
         

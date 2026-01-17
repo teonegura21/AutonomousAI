@@ -461,22 +461,17 @@ def cmd_kali_exec(args):
 
 def cmd_interactive(args):
     """Interactive mode"""
-    from ai_autonom.orchestration.nemotron_orchestrator import NemotronOrchestrator
-    
-    print_banner()
-    
-    orchestrator = NemotronOrchestrator(
-        enable_checkpoints=True,
-        enable_testing=False,
-        enable_dashboard=True
-    )
-    
-    # If dashboard is enabled, we need to wait for it to initialize
-    # The dashboard runs in a separate thread started by .run(), but for interactive mode
-    # we might want to start it immediately if we're not running a specific goal yet.
-    # However, NemotronOrchestrator structure starts it in .run().
-    
-    print("\nInteractive Mode - Enter goals or commands")
+    try:
+        from ai_autonom.cli.repl import AutonomREPL
+        repl = AutonomREPL()
+        repl.run()
+    except ImportError as e:
+        print(f"Error loading REPL: {e}")
+        # Fallback to old interactive mode if needed
+        from ai_autonom.orchestration.nemotron_orchestrator import NemotronOrchestrator
+        orchestrator = NemotronOrchestrator()
+        print("Fallback interactive mode...")
+        # ... (rest of old logic logic)
     print("Commands: /status, /models, /tools, /kali, /quit\n")
     
     while True:
@@ -571,6 +566,11 @@ Examples:
     parser.add_argument("--model", type=str, help="Override orchestrator model")
     
     args = parser.parse_args()
+    
+    if not RICH_AVAILABLE:
+        print("[WARNING] 'rich' library not found. TUI disabled. Install with: pip install rich")
+    else:
+        print("[INFO] 'rich' library loaded. TUI enabled during execution.")
     
     # Route to appropriate command
     try:

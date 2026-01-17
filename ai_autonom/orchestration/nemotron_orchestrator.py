@@ -45,6 +45,8 @@ from ai_autonom.orchestration.testing_workflow import TestingWorkflow
 from ai_autonom.orchestration.langgraph_workflow import MultiAgentWorkflow, WorkflowState
 from ai_autonom.patterns.handoffs import HandoffManager
 from ai_autonom.memory.knowledge_base import KnowledgeBase
+from ai_autonom.core.session_manager import SessionManager
+from ai_autonom.monitoring.debug_logger import log_debug
 
 # Monitoring imports
 from ai_autonom.monitoring.telemetry import ExecutionMonitor
@@ -224,6 +226,7 @@ class NemotronOrchestrator:
         self.testing_workflow = TestingWorkflow()
         self.workflow_engine = MultiAgentWorkflow(orchestrator=self)
         self.handoff_manager = HandoffManager(self.registry)
+        self.session_manager = SessionManager()
         
         # Monitoring
         self.monitor = ExecutionMonitor()
@@ -488,6 +491,9 @@ Rules:
             data = json.loads(content)
             tasks = data.get('tasks', [])
             
+            # DEBUG LOG
+            log_debug("NEMOTRON", data, "PLAN")
+            
             # Add testing tasks if enabled
             if self.enable_testing:
                 tasks = self.testing_workflow.add_testing_tasks(tasks)
@@ -651,6 +657,20 @@ Return JSON ONLY:
         kb_summary = self.knowledge_base.get_summary()
         context_str += f"\n\n{kb_summary}"
         
+        # 3. Session Context
+        session_path = self.session_manager.current_session_dir
+        context_str += f"""
+        
+[SESSION WORKSPACE]
+You are working in a persistent session.
+- Source Code: {session_path}/src/
+- Binaries/EXEs: {session_path}/bin/
+- Docs: {session_path}/docs/
+
+IMPORTANT: When creating files, ALWAYS use these paths.
+Example: 'filesystem_write' path='{session_path}/src/main.cpp'
+"""
+        
         task_description = task.get('description', '') + context_str
         
         start = time.time()
@@ -675,8 +695,16 @@ Available tools: {', '.join(task.get('tools', []))}
 
 You MUST use tools to complete this task. Don't just describe what to do - ACTUALLY DO IT!
 
+*** CRITICAL PROTOCOL: PRE-FLIGHT CHECK ***
+1. VERIFY TOOLS FIRST: Before running a complex task, verify you have the specific tool installed.
+   - Example: If task is "Compile C++", run `cai_generic_linux_command` with "which g++" or "which x86_64-w64-mingw32-g++".
+   - Example: If task is "Scan network", run "which nmap".
+2. NO HALLUCINATED TOOLS: If `which` returns nothing, the tool is MISSING.
+3. STOP AND ASK: If a critical tool is missing, DO NOT try to use Python to emulate it. DO NOT hallucinate that it works.
+   - IMMEDIATELY output: `ASK_USER: "I need [Tool Name] to perform [Task], but it is missing. How should I proceed?"`
+
 DYNAMIC TOOL ACCESS:
-If you determine that the assigned tools are insufficient, you may request access to any other tool in the registry.
+If you determine that the assigned tools are insufficient (after checking), you may request access to any other tool in the registry.
 To do this, output:
 REQUEST_TOOL: <tool_name_or_description>
 reason: <why you need it>
@@ -687,9 +715,14 @@ To do this, output:
 REQUEST_HANDOFF: <agent_name>
 context: <what you want them to do>
 
-The Orchestrator will evaluate your request. If approved, the tool will be added to your kit. If denied, you will be given an alternative strategy.
+ASK THE USER:
+If you are stuck, lack information, or need a decision (e.g., "Should I perform a destructive scan?", "I don't have a compiler"), ASK THE USER.
+To do this, output:
+ASK_USER: <your question>
 
-IMPORTANT RULES:
+The Orchestrator will pause and get the user's response for you.
+
+IMPORTANT EXECUTION RULES:
 1. Start with reconnaissance tools (nmap, curl) to gather information
 2. Only analyze files that EXIST (check with 'ls' first)
 3. If a tool fails, READ THE ERROR and fix your parameters
@@ -707,12 +740,12 @@ Or for direct commands:
                     command: your command here
 
 Examples:
+                    TOOL: cai_generic_linux_command
+                    command: which g++
+
                     TOOL: cai_nmap_scan
                     target: 192.168.1.0/24
                     args: -sV -sC
-
-                    TOOL: cai_generic_linux_command
-                    command: nmap -sV 192.168.1.1
 
 After analyzing tool output:
                     - If tool FAILED: Fix parameters and try again
@@ -750,6 +783,9 @@ REMEMBER: DO NOT say COMPLETE until you've successfully gathered meaningful info
                 response = provider.chat(conversation_history, agent.model_name)
                 agent_msg = response.content
                 full_response += f"\n\n=== Iteration {iteration} ===\n{agent_msg}"
+                
+                # DEBUG LOG
+                log_debug(f"AGENT_{agent.name}", agent_msg, "THOUGHT")
                 
                 if self.dashboard:
                     self.dashboard.set_active_agent(agent.name, "Thinking")
@@ -869,6 +905,35 @@ Please continue the task yourself."""
                     conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
                     conversation_history.append(LLMMessage(role="user", content=feedback))
 
+                elif "ASK_USER:" in agent_msg:
+                    import re
+                    question_match = re.search(r'ASK_USER:\s*(.+)', agent_msg, re.DOTALL)
+                    question = question_match.group(1).strip() if question_match else "User attention required."
+                    
+                    if self.dashboard:
+                        self.dashboard.log(f"Agent asking: {question[:50]}...")
+                        self.dashboard.set_active_agent(agent.name, "Waiting for User")
+                    
+                    # Pause and get input
+                    # We need a way to get input from the TUI/REPL context.
+                    # For now, we'll use standard input if TUI isn't blocking, 
+                    # OR if we are in REPL, we need a callback.
+                    
+                    print(f"\n\n[AGENT ASK] {agent.name}: {question}")
+                    print(">> Type your answer and press Enter:")
+                    
+                    # If TUI is active, this might break layout unless we handle it.
+                    # Ideally, the TUI should have an input box.
+                    # Fallback to simple input for MVP correctness.
+                    user_response = input("> ")
+                    
+                    feedback = f"USER RESPONSE: {user_response}"
+                    conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
+                    conversation_history.append(LLMMessage(role="user", content=feedback))
+                    
+                    if self.dashboard:
+                        self.dashboard.log("User responded.")
+
                 elif "TOOL:" in agent_msg or "COMPLETE:" in agent_msg:
                     # Parse tool call - simple line-based format
                     if "TOOL:" in agent_msg:
@@ -927,10 +992,18 @@ Please continue the task yourself."""
                             task_id=task_id
                         )
                         
+                        # DEBUG LOG
+                        log_debug(f"TOOL_{tool_name}", {"params": params, "output": tool_output, "success": success}, "EXECUTION")
+                        
                         if self.dashboard:
                             self.dashboard.set_active_tool(None)
                             status = "Success" if success else "Failed"
-                            self.dashboard.log(f"Tool {tool_name}: {status}")
+                            # Log failure details to dashboard if failed
+                            if not success:
+                                error_preview = tool_output[:50].replace('\n', ' ')
+                                self.dashboard.log(f"Tool Failed: {error_preview}...")
+                            else:
+                                self.dashboard.log(f"Tool {tool_name}: {status}")
                         
                         print(f"[RESULT] {tool_output[:500]}...\n")
                         
@@ -1040,6 +1113,12 @@ Do NOT give up. Use the tools and try again!"""
             self.task_memory.complete_task(task_id, full_response, [])
             self.monitor.log_task_complete(task_id, True, tokens=len(full_response.split()))
             
+            # === VRAM OPTIMIZATION: Unload Agent ===
+            # After task completion, unload the agent's model to free VRAM for the next agent
+            if self.config.get('execution.vram_optimized', True):
+                if hasattr(provider, 'unload_model'):
+                    provider.unload_model(agent.model_name)
+            
             # === LIVE MONITOR: Show task complete ===
             if LIVE_MONITOR_AVAILABLE:
                 monitor = get_live_monitor()
@@ -1079,6 +1158,10 @@ Do NOT give up. Use the tools and try again!"""
         
         total_start = time.time()
         
+        # Initialize Session (Create Folders)
+        session_path = self.session_manager.create_session(user_goal)
+        print(f"[SESSION] Active Workspace: {session_path}")
+        
         # Start workflow
         self.current_workflow_id = self.task_memory.start_workflow()
         
@@ -1094,6 +1177,12 @@ Do NOT give up. Use the tools and try again!"""
             
         # Phase 2: Decomposition
         tasks = self.decompose_and_assign(user_goal, enhancement)
+        
+        # === VRAM OPTIMIZATION: Unload Orchestrator ===
+        # If we are using Ollama, unload Nemotron to free VRAM for the agents
+        if self.orchestrator_provider_type == 'ollama' and self.config.get('execution.vram_optimized', True):
+            if hasattr(self.orchestrator_provider, 'unload_model'):
+                self.orchestrator_provider.unload_model(self.orchestrator_model)
         
         if self.dashboard:
             self.dashboard.update_plan(tasks)
@@ -1157,6 +1246,9 @@ Do NOT give up. Use the tools and try again!"""
         print(f"\n{'#'*70}")
         print("ORCHESTRATION COMPLETE")
         print(f"{'#'*70}\n")
+        
+        if self.dashboard:
+            self.dashboard.stop()
         
         return {
             "success": successful == len(tasks),

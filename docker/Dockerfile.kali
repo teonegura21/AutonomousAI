@@ -72,6 +72,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gdb-peda \
     ltrace \
     strace \
+    # Compilation & Cross-Compilation
+    build-essential \
+    mingw-w64 \
+    cmake \
     # Forensics (volatility3 installed via pip)
     foremost \
     autopsy \

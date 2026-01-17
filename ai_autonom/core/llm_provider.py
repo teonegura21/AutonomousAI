@@ -186,25 +186,23 @@ class OllamaProvider(BaseLLMProvider):
                 yield chunk["message"]["content"]
     
     def list_models(self) -> List[str]:
-        """List available Ollama models"""
-        if not self._client:
-            return []
+        """List available models"""
         try:
-            response = self._client.list()
-            return [m.get("name", "") for m in response.get("models", [])]
-        except:
-            return []
-    
-    def embeddings(self, text: str, model: str = "nomic-embed-text") -> List[float]:
-        """Get embeddings"""
-        if not self._client:
-            return []
-        try:
-            response = self._client.embeddings(model=model, prompt=text)
-            return response.get("embedding", [])
-        except:
+            response = self.client.list()
+            return [m['name'] for m in response.get('models', [])]
+        except Exception as e:
+            print(f"[OLLAMA] List models failed: {e}")
             return []
 
+    def unload_model(self, model_name: str):
+        """Force unload a model from VRAM (Ollama specific)"""
+        try:
+            print(f"[OLLAMA] Unloading model: {model_name}...")
+            # keep_alive=0 tells Ollama to unload immediately
+            self.client.chat(model=model_name, messages=[], keep_alive=0)
+            print(f"[OLLAMA] Unloaded {model_name}")
+        except Exception as e:
+            print(f"[OLLAMA] Failed to unload {model_name}: {e}")
 
 class OpenAIProvider(BaseLLMProvider):
     """OpenAI API provider (also works with compatible APIs)"""

@@ -143,7 +143,8 @@ def get_cai_security_agents() -> List[AgentDefinition]:
             tools=[
                 "cai_generic_linux_command", "cai_nmap_scan", "cai_netcat",
                 "cai_filesystem_read", "cai_filesystem_write", "python_exec",
-                "cai_capture_remote_traffic", "cai_record_finding", "cai_record_credential"
+                "cai_capture_remote_traffic", "cai_record_finding", "cai_record_credential",
+                "compile_cpp"
             ],
             vram_required=2.0,
             speed_tokens_per_sec=60.0,

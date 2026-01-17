@@ -29,6 +29,7 @@ try:
         objdump_disasm, volatility_analyze, pcap_analyze, log_analyze,
         timeline_create, http_request, google_search, shodan_search, shodan_host_info
     )
+    from .compiler_tools import compile_cpp
     CAI_TOOLS_AVAILABLE = True
 except ImportError as e:
     CAI_TOOLS_AVAILABLE = False
@@ -92,6 +93,17 @@ class ToolExecutor:
         
         # Register all built-in tools
         self._register_builtin_tools()
+        
+        self.registry.register(ToolDefinition(
+            id="compile_cpp",
+            name="Compile C++",
+            description="Compile C++ code to portable executable (supports Windows .exe)",
+            category="development",
+            function=compile_cpp,
+            requires_sandbox=True,
+            parameters={"source_file": "Path to .cpp", "output_name": "Output name (no ext)", "target_os": "windows/linux"},
+            returns="Compilation output"
+        ))
         
         # Register CAI security tools
         if CAI_TOOLS_AVAILABLE:
