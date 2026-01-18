@@ -1,5 +1,5 @@
 """
-Orchestration module - Core orchestration components
+Orchestration module - Core orchestration components, IPC
 """
 
 # Import components that don't require ollama
@@ -16,6 +16,20 @@ from .human_checkpoint import (
 )
 from .testing_workflow import TestingWorkflow, TestResult
 from .langgraph_workflow import MultiAgentWorkflow, WorkflowState
+
+# Import IPC Broker
+try:
+    from .ipc_broker import (
+        IPCBroker,
+        IPCMessage,
+        MessagePriority,
+        get_broker,
+        reset_broker,
+    )
+    IPC_AVAILABLE = True
+except ImportError:
+    IPC_AVAILABLE = False
+    IPCBroker = None
 
 # NemotronOrchestrator requires ollama, import lazily
 def get_orchestrator():
@@ -42,6 +56,12 @@ __all__ = [
     'TestResult',
     'MultiAgentWorkflow',
     'WorkflowState',
-    'get_orchestrator'
+    'get_orchestrator',
+    # IPC
+    'IPCBroker',
+    'IPCMessage',
+    'get_broker',
+    'IPC_AVAILABLE',
 ]
+
 

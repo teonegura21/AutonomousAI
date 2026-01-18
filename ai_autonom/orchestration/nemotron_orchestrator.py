@@ -48,6 +48,18 @@ from ai_autonom.memory.knowledge_base import KnowledgeBase
 from ai_autonom.core.session_manager import SessionManager
 from ai_autonom.monitoring.debug_logger import log_debug
 
+# Capability checking for honest failure detection
+try:
+    from ai_autonom.core.capability_checker import (
+        CapabilityChecker,
+        get_enhanced_system_prompt,
+        HONEST_FAILURE_PROMPT
+    )
+    CAPABILITY_CHECKER_AVAILABLE = True
+except ImportError:
+    CAPABILITY_CHECKER_AVAILABLE = False
+    CapabilityChecker = None
+
 # Monitoring imports
 from ai_autonom.monitoring.telemetry import ExecutionMonitor
 from ai_autonom.monitoring.live_dashboard import get_dashboard
@@ -688,73 +700,99 @@ Example: 'filesystem_write' path='{session_path}/src/main.cpp'
             else:
                 base_prompt = f"You are {agent.name}."
             
-            # Construct full system message with tools and rules
+            # Enhanced system message with capability checking and honest failure protocol
+            task_description = task.get('description', '')
+            
+            # Check capabilities BEFORE execution
+            capability_warning = ""
+            if CAPABILITY_CHECKER_AVAILABLE:
+                checker = CapabilityChecker()
+                cap_check = checker.validate(task_description)
+                if not cap_check.can_complete:
+                    capability_warning = cap_check.to_prompt_message()
+                    print(f"[CAPABILITY] Task may be impossible: {cap_check.explanation}")
+            
+            # Construct full system message with enhanced rules
             system_message = f"""{base_prompt}
 
 Available tools: {', '.join(task.get('tools', []))}
 
 You MUST use tools to complete this task. Don't just describe what to do - ACTUALLY DO IT!
 
-*** CRITICAL PROTOCOL: PRE-FLIGHT CHECK ***
-1. VERIFY TOOLS FIRST: Before running a complex task, verify you have the specific tool installed.
-   - Example: If task is "Compile C++", run `cai_generic_linux_command` with "which g++" or "which x86_64-w64-mingw32-g++".
-   - Example: If task is "Scan network", run "which nmap".
-2. NO HALLUCINATED TOOLS: If `which` returns nothing, the tool is MISSING.
-3. STOP AND ASK: If a critical tool is missing, DO NOT try to use Python to emulate it. DO NOT hallucinate that it works.
-   - IMMEDIATELY output: `ASK_USER: "I need [Tool Name] to perform [Task], but it is missing. How should I proceed?"`
+*** CRITICAL: HONEST FAILURE PROTOCOL ***
 
-DYNAMIC TOOL ACCESS:
-If you determine that the assigned tools are insufficient (after checking), you may request access to any other tool in the registry.
-To do this, output:
-REQUEST_TOOL: <tool_name_or_description>
-reason: <why you need it>
+Before attempting ANY task, you MUST verify capability:
 
-DYNAMIC AGENT HANDOFF:
-If you need help from a specialist agent (e.g., 'Retester Agent' for verifying a bug, 'Web App Pentester' for complex web attacks), request a handoff.
-To do this, output:
-REQUEST_HANDOFF: <agent_name>
-context: <what you want them to do>
+1. VERIFY TOOLS EXIST:
+   - Run "which <tool>" for every tool you plan to use
+   - If tool doesn't exist -> CANNOT proceed, must report IMPOSSIBLE_TASK
 
-ASK THE USER:
-If you are stuck, lack information, or need a decision (e.g., "Should I perform a destructive scan?", "I don't have a compiler"), ASK THE USER.
-To do this, output:
-ASK_USER: <your question>
+2. IMPOSSIBLE TASKS - These CANNOT be done without specific tools:
+   - Creating .exe files: Requires mingw-w64 or PyInstaller (Python ALONE cannot do this!)
+   - Compiling C/C++: Requires gcc/g++/clang (NOT Python)
+   - Network scanning: Requires nmap (cannot be emulated with Python)
+   - Password cracking: Requires john/hashcat
+   - Memory forensics: Requires volatility
 
-The Orchestrator will pause and get the user's response for you.
+3. WHEN TASK IS IMPOSSIBLE:
+   DO NOT:
+   - Pretend to do it or simulate the output
+   - Use Python to "emulate" missing tools
+   - Say "I'll try anyway"
+   - Hallucinate fake results
+   
+   DO:
+   - Stop immediately
+   - Output: IMPOSSIBLE_TASK: [clear explanation of why]  
+   - Suggest: What tool is needed and how to install it
+   - Then: ASK_USER: "Should I install the required tool or try an alternative?"
 
-IMPORTANT EXECUTION RULES:
-1. Start with reconnaissance tools (nmap, curl) to gather information
-2. Only analyze files that EXIST (check with 'ls' first)
-3. If a tool fails, READ THE ERROR and fix your parameters
-4. DO NOT give up after one failure - retry with corrected parameters
-5. Use 'cai_generic_linux_command' for any bash command
-6. Focus on the ACTUAL target provided by the user
+{capability_warning}
 
-To use a tool, respond with:
-                    TOOL: tool_name
-                    target: value
-                    args: value
+*** TOOL USAGE ***
 
-Or for direct commands:
-                    TOOL: cai_generic_linux_command
-                    command: your command here
+To use a tool:
+    TOOL: tool_name
+    target: value
+    args: value
 
-Examples:
-                    TOOL: cai_generic_linux_command
-                    command: which g++
+Or for Linux commands:
+    TOOL: cai_generic_linux_command
+    command: your command here
 
-                    TOOL: cai_nmap_scan
-                    target: 192.168.1.0/24
-                    args: -sV -sC
+*** PRE-FLIGHT EXAMPLE ***
 
-After analyzing tool output:
-                    - If tool FAILED: Fix parameters and try again
-                    - If you need more data: Use another tool
-                    - If task is FULLY COMPLETE: Say COMPLETE: [summary]
+User asks: "Create a Windows .exe from my Python script"
 
-You have FULL FREEDOM to execute ANY command in the Kali container.
+CORRECT BEHAVIOR:
+    TOOL: cai_generic_linux_command
+    command: which x86_64-w64-mingw32-gcc && which pyinstaller
+    
+    [Output: nothing found]
+    
+    IMPOSSIBLE_TASK: Cannot create Windows .exe files.
+    - Python alone cannot produce .exe files
+    - Required: mingw-w64 (apt install mingw-w64) OR PyInstaller (pip install pyinstaller)
+    ASK_USER: "Neither mingw-w64 nor PyInstaller is installed. Should I install one of them?"
 
-REMEMBER: DO NOT say COMPLETE until you've successfully gathered meaningful information!"""
+WRONG BEHAVIOR:
+    "I'll write a Python script that creates an exe..." <- WRONG, this is impossible
+    "Creating exe file..." <- WRONG, hallucinating
+
+*** DYNAMIC REQUESTS ***
+
+REQUEST_TOOL: <tool_name> - Request additional tool access
+REQUEST_HANDOFF: <agent_name> - Hand off to specialist agent
+ASK_USER: <question> - Ask user for decision or clarification
+
+*** EXECUTION RULES ***
+
+1. ALWAYS run "which <tool>" before using a tool
+2. If tool doesn't exist -> IMPOSSIBLE_TASK, do not proceed
+3. If a command fails, READ THE ERROR and fix parameters
+4. Focus on the ACTUAL target provided by user
+5. NEVER say COMPLETE unless task was actually accomplished
+6. You have FULL FREEDOM to execute commands in Kali container"""
 
             conversation_history = [
                 LLMMessage(

@@ -1,11 +1,34 @@
 """
-Tools module - Tool Registry, Executors, Built-in Tools, and CAI Security Tools
+Tools module - Tool Registry, Executors, Built-in Tools, CAI Security Tools, and Kill Chain Tools
 """
 
 from .tool_registry import ToolRegistry, ToolDefinition
 from .builtin_tools import BuiltinTools
 from .tool_executor import ToolExecutor
 from .code_executor import CodeExecutor
+
+# Import Kill Chain Tools (ported from CAI)
+try:
+    from .kill_chain_tools import (
+        KillChainTools,
+        create_kill_chain_tools,
+        run_command,
+        ShellSession,
+        create_shell_session,
+        list_shell_sessions,
+        get_session_output,
+        terminate_session,
+        # Guardrail functions
+        validate_command,
+        detect_unicode_homographs,
+        sanitize_external_content,
+        detect_injection_patterns,
+        redact_secrets,
+    )
+    KILL_CHAIN_TOOLS_AVAILABLE = True
+except ImportError:
+    KILL_CHAIN_TOOLS_AVAILABLE = False
+    KillChainTools = None
 
 # Import CAI Security Tools
 try:
@@ -17,7 +40,7 @@ try:
         get_tools_by_category,
         list_all_tools,
         # Core execution
-        run_command,
+        run_command as cai_run_command,
         generic_linux_command,
         execute_code,
         # Reconnaissance
@@ -70,9 +93,14 @@ __all__ = [
     'BuiltinTools',
     'ToolExecutor',
     'CodeExecutor',
+    # Kill Chain Tools
+    'KillChainTools',
+    'create_kill_chain_tools',
+    'KILL_CHAIN_TOOLS_AVAILABLE',
     # CAI Tools
     'CAI_SECURITY_TOOLS',
     'AGENT_TOOLS',
     'get_tools_for_agent',
     'CAI_TOOLS_AVAILABLE',
 ]
+

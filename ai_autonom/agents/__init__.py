@@ -1,9 +1,24 @@
 """
 AI Autonom Agents Module
-Includes CAI-adapted security agents and custom agents
+Includes CAI-adapted security agents, custom agents, and prompt loader
 """
 
 from typing import Dict, List, Any
+
+# Import prompt loader (ported from CAI)
+try:
+    from .prompt_loader import (
+        load_prompt,
+        load_prompt_safe,
+        get_available_prompts,
+        get_prompt_info,
+        create_agent_prompt,
+        AgentPrompts,
+    )
+    PROMPT_LOADER_AVAILABLE = True
+except ImportError:
+    PROMPT_LOADER_AVAILABLE = False
+    AgentPrompts = None
 
 # Import all agent definitions
 try:
