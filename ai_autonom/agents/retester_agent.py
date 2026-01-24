@@ -26,7 +26,7 @@ class RetesterAgent:
     
     id: str = "retester"
     name: str = "Security Retester"
-    model_name: str = "qwen3:1.7b"
+    model_name: str = "qwen2.5-coder:7b"
     provider: str = "ollama"
     
     capabilities: List[str] = None

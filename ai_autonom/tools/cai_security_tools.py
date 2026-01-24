@@ -441,7 +441,7 @@ record_finding = _TOOLS.record_finding
 record_credential = _TOOLS.record_credential
 
 # Placeholders for compatibility
-execute_code = lambda code: _TOOLS.generic_linux_command(f"python3 -c '{code}'")
+execute_code = lambda code: _TOOLS.generic_linux_command(f"python -c '{code}'")
 filesystem_read = lambda path: _TOOLS.generic_linux_command(f"cat {path}")
 filesystem_write = lambda path, content: _TOOLS.generic_linux_command(f"cat > {path} << 'EOF'\n{content}\nEOF")
 filesystem_search = lambda dir, pat: _TOOLS.generic_linux_command(f"find {dir} -name '{pat}'")

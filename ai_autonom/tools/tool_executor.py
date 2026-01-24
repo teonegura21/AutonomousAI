@@ -64,7 +64,8 @@ class ToolExecutor:
         sandbox=None,
         workspace_dir: str = "outputs",
         enable_logging: bool = True,
-        use_containers: bool = True
+        use_containers: bool = True,
+        require_kali_for_security: bool = False
     ):
         self.registry = ToolRegistry()
         self.builtin_tools = BuiltinTools(sandbox, workspace_dir)
@@ -72,6 +73,7 @@ class ToolExecutor:
         self.workspace_dir = workspace_dir
         self.enable_logging = enable_logging
         self.use_containers = use_containers
+        self.require_kali_for_security = require_kali_for_security
         
         # Initialize container router
         self.container_router: Optional[ContainerToolRouter] = None
@@ -119,8 +121,10 @@ class ToolExecutor:
         # Register all CAI tools from the security tools module
         for tool_id, tool_info in CAI_SECURITY_TOOLS.items():
             try:
+                # Direct registration without prefix to match AgentRegistry expectations
+                # (CAI tools have unique names like nmap_scan anyway)
                 self.registry.register(ToolDefinition(
-                    id=f"cai_{tool_id}",  # Prefix with cai_ to avoid conflicts
+                    id=tool_id, 
                     name=tool_info.get("description", tool_id),
                     description=tool_info.get("description", ""),
                     category=f"cai_{tool_info.get('category', 'misc')}",
@@ -138,23 +142,22 @@ class ToolExecutor:
         """Register all built-in tools in the registry"""
         
         # Filesystem tools
-        self.registry.register(ToolDefinition(
-            id="filesystem_read",
-            name="Read File",
-            description="Read contents of a file",
-            category="filesystem",
-            function=self.builtin_tools.filesystem_read,
-            requires_sandbox=False,
-            parameters={"path": "Path to file (relative or absolute)"},
-            returns="File contents as string"
-        ))
-        
+        def safe_write(path=None, content=None, target=None, args=None):
+            # Resolve path - prevent outputs/outputs doubling
+            final_path = path or target
+            if final_path and final_path.startswith("outputs/"):
+                final_path = final_path.replace("outputs/", "", 1)
+            if final_path and not Path(final_path).is_absolute():
+                if "/" not in final_path and "\\" not in final_path:
+                    final_path = f"src/{final_path}"
+            return self.builtin_tools.filesystem_write(final_path, content or args)
+
         self.registry.register(ToolDefinition(
             id="filesystem_write",
             name="Write File",
             description="Write content to a file",
             category="filesystem",
-            function=self.builtin_tools.filesystem_write,
+            function=safe_write,
             requires_sandbox=True,
             parameters={"path": "Path to file", "content": "Content to write"},
             returns="Success message"
@@ -165,7 +168,7 @@ class ToolExecutor:
             name="Append to File",
             description="Append content to existing file",
             category="filesystem",
-            function=self.builtin_tools.filesystem_append,
+            function=lambda path=None, content=None, target=None, args=None: self.builtin_tools.filesystem_append(path or target, content or args),
             requires_sandbox=True,
             parameters={"path": "Path to file", "content": "Content to append"},
             returns="Success message"
@@ -198,19 +201,37 @@ class ToolExecutor:
             name="Delete File",
             description="Delete a file",
             category="filesystem",
-            function=self.builtin_tools.filesystem_delete,
+            function=lambda path=None, target=None: self.builtin_tools.filesystem_delete(path or target),
             requires_sandbox=True,
             parameters={"path": "Path to file to delete"},
             returns="Success message"
         ))
         
         # Code execution tools
+        def safe_python_exec(code=None, filename=None, timeout=30, target=None, args=None):
+            # If agent provided code in 'args' or 'content'
+            final_code = code or (args if args and not args.endswith(".py") else None)
+            # If agent provided filename in 'target' or 'filename' or 'args'
+            final_file = filename or target or (args if args and args.endswith(".py") else None)
+            
+            # Resolve path - prevent outputs/outputs doubling
+            if final_file and final_file.startswith("outputs/"):
+                final_file = final_file.replace("outputs/", "", 1)
+
+            if final_file and not Path(final_file).is_absolute():
+                if "/" not in final_file and "\\" not in final_file:
+                    final_file = f"src/{final_file}"
+            elif not final_file:
+                final_file = "src/script.py"
+                
+            return self.builtin_tools.python_exec(final_code, final_file or "script.py", timeout)
+
         self.registry.register(ToolDefinition(
             id="python_exec",
             name="Execute Python",
             description="Execute Python code",
             category="code_execution",
-            function=self.builtin_tools.python_exec,
+            function=safe_python_exec,
             requires_sandbox=True,
             parameters={
                 "code": "Python code to execute",
@@ -465,20 +486,87 @@ class ToolExecutor:
         Returns:
             Tuple of (success, result_or_error)
         """
+        # Block CAI tools for non-security agents
+        if tool_id.startswith("cai_") and not self._is_security_agent(agent_id):
+            return False, "[ERROR] cai_* tools are reserved for security tasks. Use bash_exec or python_exec."
+
+        # Block if Kali execution is required but executor is missing
+        if self.require_kali_for_security and agent_id and not self.kali_executor:
+            if self._should_use_kali_fallback(agent_id, tool_id):
+                return False, "[ERROR] Kali executor required but unavailable. Ensure Docker and Kali container are running."
+
         # === AUTOMATIC KALI ROUTING FOR SECURITY AGENTS ===
         if self.kali_executor and agent_id:
             # Check if this agent/tool should run in Kali
             if self.kali_executor.should_use_kali(agent_id, tool_id):
+                if self.require_kali_for_security and not self.kali_executor.is_available():
+                    return False, "[ERROR] Kali container required but not available. Start: cd docker && docker-compose up -d kali"
+
                 print(f"[TOOL_EXECUTOR] Routing {agent_id}/{tool_id} to Kali container")
                 
+                # SPECIAL HANDLERS FOR FILE OPERATIONS
+                if tool_id == "filesystem_write":
+                    # Handle parameter aliases (agent might use target/args instead of path/content)
+                    path = params.get('path') or params.get('target') or ''
+                    content = params.get('content') or params.get('args') or ''
+                    
+                    success, msg = self.kali_executor.write_file(path, content)
+                    if self.enable_logging:
+                        self.execution_history.append({
+                            "tool_id": tool_id,
+                            "agent_id": agent_id,
+                            "task_id": task_id,
+                            "params": {k: str(v)[:100] for k, v in params.items()},
+                            "success": success,
+                            "duration_sec": 0.1,
+                            "timestamp": datetime.now().isoformat(),
+                            "error": None if success else msg,
+                            "execution_env": "kali_direct"
+                        })
+                    return success, msg
+                
+                if tool_id == "filesystem_read":
+                    path = params.get('path') or params.get('target') or ''
+                    success, content = self.kali_executor.read_file(path)
+                    if self.enable_logging:
+                        self.execution_history.append({
+                            "tool_id": tool_id,
+                            "agent_id": agent_id,
+                            "task_id": task_id,
+                            "params": {k: str(v)[:100] for k, v in params.items()},
+                            "success": success,
+                            "duration_sec": 0.1,
+                            "timestamp": datetime.now().isoformat(),
+                            "error": None if success else content,
+                            "execution_env": "kali_direct"
+                        })
+                    return success, content
+                    
+                if tool_id == "list_files" or tool_id == "ls":
+                    success, content = self.kali_executor.list_files(params.get('path', '.') or params.get('directory', '.'))
+                    return success, content
+
                 # Build command from tool and params
                 command = self._build_kali_command(tool_id, params)
                 if command:
-                    return self.kali_executor.execute_in_kali(
+                    success, result = self.kali_executor.execute_in_kali(
                         command=command,
                         agent_id=agent_id,
                         timeout=params.get('timeout', 300)
                     )
+                    if self.enable_logging:
+                        self.execution_history.append({
+                            "tool_id": tool_id,
+                            "agent_id": agent_id,
+                            "task_id": task_id,
+                            "params": {k: str(v)[:100] for k, v in params.items()},
+                            "success": success,
+                            "duration_sec": None,
+                            "timestamp": datetime.now().isoformat(),
+                            "error": None if success else "Kali execution failed",
+                            "execution_env": "kali"
+                        })
+                    return success, result
         
         # === STANDARD TOOL EXECUTION ===
         tool = self.registry.get_tool(tool_id)
@@ -518,7 +606,8 @@ class ToolExecutor:
                 "success": success,
                 "duration_sec": duration,
                 "timestamp": start_time.isoformat(),
-                "error": error
+                "error": error,
+                "execution_env": "local"
             })
         
         if self.enable_logging:
@@ -526,6 +615,31 @@ class ToolExecutor:
             print(f"[TOOL] {tool_id} [{status}] ({duration:.2f}s)")
         
         return success, result
+
+    def _should_use_kali_fallback(self, agent_id: str, tool_id: str) -> bool:
+        """Fallback check for Kali routing when executor is unavailable."""
+        kali_tool_prefixes = ["cai_", "kali_", "nmap", "sqlmap", "metasploit",
+                              "binwalk", "volatility", "hydra", "john", "gobuster"]
+        if any(tool_id.startswith(prefix) for prefix in kali_tool_prefixes):
+            return True
+        return False
+
+    def _is_security_agent(self, agent_id: Optional[str]) -> bool:
+        """Best-effort check for security-focused agents."""
+        if not agent_id:
+            return False
+        agent_id = agent_id.lower()
+        markers = [
+            "red_team",
+            "pentester",
+            "security",
+            "kali",
+            "cai",
+            "dfir",
+            "bug_bounty",
+            "recon",
+        ]
+        return any(marker in agent_id for marker in markers)
     
     def _build_kali_command(self, tool_id: str, params: Dict[str, Any]) -> Optional[str]:
         """
@@ -548,7 +662,7 @@ class ToolExecutor:
             code = params['code']
             filename = params.get('filename', 'agent_script.py')
             # Write code to file and execute
-            return f"cat > /workspace/{filename} << 'EOFCODE'\n{code}\nEOFCODE\npython3 /workspace/{filename}"
+            return f"cat > /workspace/{filename} << 'EOFCODE'\n{code}\nEOFCODE\npython /workspace/{filename}"
         
         # === RECONNAISSANCE & NETWORK TOOLS ===
         nmap_patterns = {
@@ -899,7 +1013,8 @@ class ToolExecutor:
         self,
         container_type: str,
         command: str,
-        timeout: int = 30
+        timeout: int = 30,
+        user: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
         Execute a raw command in a specific container.
@@ -908,6 +1023,7 @@ class ToolExecutor:
             container_type: Type of container (sandbox, security, web, nodejs)
             command: Command to execute
             timeout: Execution timeout
+            user: Optional user to run as inside container
         
         Returns:
             Tuple of (success, output)
@@ -939,7 +1055,7 @@ class ToolExecutor:
             return False, f"Container not running: {config.container_name}"
         
         return self.container_router._execute_in_container(
-            container, command, config.workdir, timeout
+            container, command, config.workdir, timeout, user=user
         )
     
     def write_to_container(

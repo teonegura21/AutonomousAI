@@ -34,6 +34,7 @@ from typing import Dict, Any, Optional, List, Set, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from ai_autonom.core.config import get_config
 
 # Import vector store if available
 try:
@@ -128,7 +129,7 @@ class SharedContextManager:
         self,
         enable_vector: bool = True,
         enable_ipc: bool = True,
-        vector_persist_dir: str = ".runtime/data/chromadb"
+        vector_persist_dir: Optional[str] = None
     ):
         """
         Initialize shared context manager.
@@ -146,6 +147,11 @@ class SharedContextManager:
         self._vector_store: Optional[VectorMemoryStore] = None
         if enable_vector and VECTOR_AVAILABLE:
             try:
+                if vector_persist_dir is None:
+                    vector_persist_dir = get_config().get(
+                        "memory.vector_db.persist_directory",
+                        ".runtime/data/chromadb"
+                    )
                 self._vector_store = VectorMemoryStore(persist_dir=vector_persist_dir)
                 print("[SharedContext] Vector memory enabled")
             except Exception as e:

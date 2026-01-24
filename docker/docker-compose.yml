@@ -2,47 +2,9 @@ version: '3.8'
 
 # AI Autonom Multi-Agent System
 # Complete Docker infrastructure for agent tool execution
-# Kali Linux is the default security execution environment
+# Lightweight Ubuntu-based sandboxes (tools installed on demand)
 
 services:
-  # ============================================
-  # KALI LINUX - Primary Security Execution Environment
-  # ============================================
-  kali:
-    build:
-      context: ../
-      dockerfile: docker/Dockerfile.kali
-    container_name: agent_kali
-    hostname: kali
-    volumes:
-      - kali_workspace:/workspace
-      - ../outputs:/outputs
-      - kali_logs:/logs
-      - kali_findings:/findings
-    mem_limit: 4g
-    cpus: 4.0
-    ports:
-      - "7681:7681"  # Web terminal for visibility
-    networks:
-      - agent_network
-    security_opt:
-      - seccomp:unconfined  # Required for some security tools
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    stdin_open: true
-    tty: true
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7681/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    labels:
-      - "ai.autonom.role=kali"
-      - "ai.autonom.tools=nmap,metasploit,sqlmap,binwalk,volatility,wireshark"
-      - "ai.autonom.primary=true"
-
   # ============================================
   # MAIN SANDBOX - General purpose Python execution
   # ============================================
@@ -72,7 +34,7 @@ services:
       retries: 3
     labels:
       - "ai.autonom.role=sandbox"
-      - "ai.autonom.tools=python,bash,filesystem"
+      - "ai.autonom.tools=base"
 
   # ============================================
   # SECURITY SANDBOX - Defensive analysis tools
@@ -98,7 +60,7 @@ services:
     restart: unless-stopped
     labels:
       - "ai.autonom.role=security"
-      - "ai.autonom.tools=bandit,safety,nmap,analysis"
+      - "ai.autonom.tools=base"
 
   # ============================================
   # WEB SANDBOX - Web scraping & automation
@@ -122,7 +84,7 @@ services:
     restart: unless-stopped
     labels:
       - "ai.autonom.role=web"
-      - "ai.autonom.tools=selenium,playwright,requests,scraping"
+      - "ai.autonom.tools=base"
 
   # ============================================
   # NODE.JS SANDBOX - JavaScript/TypeScript execution
@@ -145,7 +107,7 @@ services:
     restart: unless-stopped
     labels:
       - "ai.autonom.role=nodejs"
-      - "ai.autonom.tools=npm,typescript,eslint,jest"
+      - "ai.autonom.tools=node"
 
   # ============================================
   # DATABASES
@@ -184,7 +146,7 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - "6379:6379"
+      - "6380:6379"
     networks:
       - agent_network
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -229,7 +191,7 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/tools.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
-      - "8080:80"
+      - "8081:80"
     networks:
       - agent_network
     depends_on:
@@ -244,14 +206,7 @@ services:
 # VOLUMES
 # ============================================
 volumes:
-  # Kali Linux volumes
-  kali_workspace:
-    name: ai_autonom_kali_workspace
-  kali_logs:
-    name: ai_autonom_kali_logs
-  kali_findings:
-    name: ai_autonom_kali_findings
-  # Other volumes
+  # Volumes
   agent_workspace:
     name: ai_autonom_workspace
   security_workspace:

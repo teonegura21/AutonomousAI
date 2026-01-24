@@ -288,6 +288,11 @@ class CodeExecutor:
         """Clear execution history"""
         self.history.clear()
 
+    def set_workspace(self, workspace_dir: str) -> None:
+        """Change workspace directory"""
+        self.workspace_dir = workspace_dir
+        Path(workspace_dir).mkdir(parents=True, exist_ok=True)
+
 
 class CodeValidator:
     """

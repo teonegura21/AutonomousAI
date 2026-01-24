@@ -6,6 +6,8 @@ Ported from CAI with adaptations for ai_autonom framework.
 """
 
 from typing import Dict, Any, Optional, Set, List
+from dataclasses import dataclass
+from enum import Enum
 from ..core.agent_registry import AgentRegistry
 
 
@@ -16,10 +18,12 @@ ESSENTIAL_KEYS = {'target_ip', 'credentials', 'objective', 'current_stage', 'fla
 AGENT_CONTEXT_MAP = {
     'web_agent': {'ports', 'web_technologies', 'directories', 'urls'},
     'web_pentester': {'ports', 'web_technologies', 'directories', 'urls', 'cookies'},
+    'web_pentester_agent': {'ports', 'web_technologies', 'directories', 'urls', 'cookies'},
     'exploit_agent': {'vulnerabilities', 'service_versions', 'cve_ids'},
     'priv_esc_agent': {'user_context', 'suid_binaries', 'kernel_version', 'processes'},
     'lateral_movement': {'hosts', 'credentials', 'ssh_keys', 'network_map'},
     'reporting_agent': {'findings', 'vulnerabilities', 'evidence', 'timeline'},
+    'report_agent': {'findings', 'vulnerabilities', 'evidence', 'timeline'},
     'dfir_agent': {'artifacts', 'logs', 'timeline', 'iocs'},
     'triage_agent': {'vulnerabilities', 'scan_results', 'false_positives'},
 }
@@ -95,9 +99,11 @@ class HandoffManager:
     managing context transfer.
     """
     
-    def __init__(self, registry: AgentRegistry):
-        self.registry = registry
+    def __init__(self, registry: Optional[AgentRegistry] = None, message_bus=None):
+        self.registry = registry or AgentRegistry()
+        self.message_bus = message_bus
         self.handoff_history: List[Dict[str, Any]] = []
+        self._callbacks: Dict[str, List[Any]] = {}
         
     def evaluate_handoff_request(
         self, 
@@ -157,6 +163,13 @@ Execute the task and return your findings to {current_agent}.
             "context_length": len(filtered_context),
             "timestamp": __import__('time').time()
         })
+
+        # Fire callbacks for the requesting agent if registered
+        for cb in self._callbacks.get(current_agent, []):
+            try:
+                cb({"from_agent": current_agent, "to_agent": target.id, "context": filtered_context})
+            except Exception:
+                pass
         
         return {
             "approved": True,
@@ -165,6 +178,30 @@ Execute the task and return your findings to {current_agent}.
             "filtered_context": filtered_context,
             "reason": "Valid handoff target"
         }
+
+    def register_callback(self, agent_id: str, callback) -> None:
+        """Register a callback for handoffs initiated by a specific agent."""
+        self._callbacks.setdefault(agent_id, []).append(callback)
+
+    def get_handoff_stats(self) -> Dict[str, Any]:
+        """Return basic handoff statistics."""
+        by_agent: Dict[str, int] = {}
+        for item in self.handoff_history:
+            by_agent[item.get("from", "unknown")] = by_agent.get(item.get("from", "unknown"), 0) + 1
+        return {
+            "total_handoffs": len(self.handoff_history),
+            "by_agent": by_agent
+        }
+
+    def auto_handoff(self, agent_id: str, result: Dict[str, Any], pattern=None):
+        """
+        Lightweight auto-handoff hook for workflow integration.
+        Currently returns a skipped result; can be expanded with rules.
+        """
+        return HandoffResult(
+            status=HandoffStatus.SKIPPED,
+            context=HandoffContext(input_data={})
+        )
     
     def get_handoff_history(self) -> List[Dict[str, Any]]:
         """Get history of all handoffs."""
@@ -201,3 +238,23 @@ CONTEXT:
 
 Please complete this task and report findings.
 """
+
+
+class HandoffStatus(Enum):
+    """Status for handoff processing."""
+    SUCCESS = "success"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+@dataclass
+class HandoffContext:
+    """Context wrapper for handoff operations."""
+    input_data: Dict[str, Any]
+
+
+@dataclass
+class HandoffResult:
+    """Result of an auto-handoff decision."""
+    status: HandoffStatus
+    context: HandoffContext

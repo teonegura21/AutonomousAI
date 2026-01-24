@@ -25,6 +25,16 @@ pydantic>=2.0.0
 pyyaml>=6.0.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
+fastapi>=0.111.0
+uvicorn>=0.27.0
+openai>=1.66.0
+tiktoken>=0.9.0
+tenacity>=9.0.0
+loguru>=0.7.3
+structlog>=24.0.0
+boto3>=1.34.0
+browser-use>=0.1.40
+playwright>=1.51.0
 
 # Development
 pytest>=8.0.0

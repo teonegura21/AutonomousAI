@@ -29,11 +29,23 @@ vector_db/
 .DS_Store
 Thumbs.db
 
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
 # Docker
 workspace_data/
 
 # Runtime data
 .runtime/
+
+# Conversations & outputs
+outputs/
+conversations/
+cli/conversations/
 
 # Logs
 *.log

@@ -24,9 +24,10 @@ class CompilerTools:
         """
         # Auto-detect path (if relative, it might be in src/)
         if not os.path.exists(source_file) and "src" not in source_file:
-             # Try looking in the session src dir if passed via session context
-             # For now, we rely on the agent getting the path right or the session manager logic
-             pass
+            if not os.path.isabs(source_file) and "/" not in source_file and "\\" not in source_file:
+                candidate = os.path.join("src", source_file)
+                if os.path.exists(candidate):
+                    source_file = candidate
 
         if target_os.lower() == "windows":
             # Use MinGW for Windows .exe (Cross-compile)
@@ -43,10 +44,8 @@ class CompilerTools:
         
         # Ensure output goes to bin/ directory if logical
         output_path = output_file
-        if "bin" not in output_path and "/" not in output_path:
-             # This heuristic depends on where the agent runs it, 
-             # but usually we want it in the same dir or specified bin dir
-             pass
+        if not os.path.isabs(output_path) and "/" not in output_path and "\\" not in output_path:
+            output_path = os.path.join("bin", output_file)
 
         command = f"{compiler} {source_file} -o {output_path} {flags}"
         

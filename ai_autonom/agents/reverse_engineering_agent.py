@@ -13,7 +13,7 @@ REVERSE_ENGINEERING_AGENT = {
                    Specializes in firmware analysis, binary disassembly,
                    decompilation, and vulnerability discovery using tools
                    like Ghidra, Binwalk, and various binary analysis utilities.""",
-    "model": "qwen3:1.7b",  # Using fast technical model
+    "model": "qwen2.5-coder:7b",  # Using fast technical model
     "role": "execution",  # This is an execution agent, not orchestrator
     "capabilities": [
         "binary_analysis",

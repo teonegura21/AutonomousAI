@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 class SessionManager:
-    def __init__(self, base_dir: str = "conversations"):
+    def __init__(self, base_dir: str = "outputs/conversations"):
         self.base_dir = base_dir
         self.current_session_id = None
         self.current_session_dir = None

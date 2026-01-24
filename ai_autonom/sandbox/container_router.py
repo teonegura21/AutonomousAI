@@ -186,7 +186,7 @@ class ContainerToolRouter:
         "kali_python": ToolMapping(
             tool_id="kali_python",
             container_type=ContainerType.KALI,
-            command_template="python3 {file}",
+            command_template="python {file}",
             requires_file=True,
             timeout=60,
             description="Execute Python in Kali"
@@ -520,14 +520,16 @@ class ContainerToolRouter:
         container,
         command: str,
         workdir: str,
-        timeout: int
+        timeout: int,
+        user: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Execute command in Docker container"""
         try:
             exit_code, output = container.exec_run(
                 f"bash -c '{command}'",
                 workdir=workdir,
-                demux=True
+                demux=True,
+                user=user
             )
             
             stdout = output[0].decode('utf-8', errors='replace') if output[0] else ""
@@ -545,9 +547,8 @@ class ContainerToolRouter:
         """Fallback local execution with enhanced safety"""
         import subprocess
         
-        # Create outputs directory if it doesn't exist
-        outputs_dir = Path("outputs")
-        outputs_dir.mkdir(exist_ok=True)
+        workspace_dir = Path(os.getenv("AI_AUTONOM_WORKSPACE", "outputs"))
+        workspace_dir.mkdir(parents=True, exist_ok=True)
         
         # Basic safety check for dangerous commands
         dangerous_patterns = [
@@ -573,7 +574,7 @@ class ContainerToolRouter:
                     capture_output=True,
                     text=True,
                     timeout=timeout,
-                    cwd=str(outputs_dir)
+                    cwd=str(workspace_dir)
                 )
             else:
                 result = subprocess.run(
@@ -582,7 +583,7 @@ class ContainerToolRouter:
                     capture_output=True,
                     text=True,
                     timeout=timeout,
-                    cwd=str(outputs_dir)
+                    cwd=str(workspace_dir)
                 )
             
             output = result.stdout
@@ -610,7 +611,7 @@ class ContainerToolRouter:
         container = self._containers.get(config.container_name)
         if not container or container.status != "running":
             # Fallback to local
-            path = Path("outputs") / filename
+            path = Path(os.getenv("AI_AUTONOM_WORKSPACE", "outputs")) / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding='utf-8')
             return True, f"Written to {path}"
@@ -644,7 +645,7 @@ class ContainerToolRouter:
         container = self._containers.get(config.container_name)
         if not container or container.status != "running":
             # Fallback to local
-            path = Path("outputs") / filename
+            path = Path(os.getenv("AI_AUTONOM_WORKSPACE", "outputs")) / filename
             if path.exists():
                 return True, path.read_text(encoding='utf-8')
             return False, f"File not found: {path}"

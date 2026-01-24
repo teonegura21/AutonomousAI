@@ -249,13 +249,15 @@ class DockerSandbox:
     def _local_execute(self, command: str, timeout: int) -> Tuple[bool, str]:
         """Fallback local execution when Docker unavailable"""
         try:
+            workspace_dir = Path(os.getenv("AI_AUTONOM_WORKSPACE", "outputs"))
+            workspace_dir.mkdir(parents=True, exist_ok=True)
             result = subprocess.run(
                 command,
                 shell=True,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                cwd="outputs"
+                cwd=str(workspace_dir)
             )
             return result.returncode == 0, result.stdout or result.stderr
         except subprocess.TimeoutExpired:
@@ -266,7 +268,7 @@ class DockerSandbox:
     def _local_write(self, filename: str, content: str) -> Tuple[bool, str]:
         """Fallback local write"""
         try:
-            path = Path("outputs") / filename
+            path = Path(os.getenv("AI_AUTONOM_WORKSPACE", "outputs")) / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding='utf-8')
             return True, f"Written to {path}"
@@ -276,7 +278,7 @@ class DockerSandbox:
     def _local_read(self, filename: str) -> Tuple[bool, str]:
         """Fallback local read"""
         try:
-            path = Path("outputs") / filename
+            path = Path(os.getenv("AI_AUTONOM_WORKSPACE", "outputs")) / filename
             return True, path.read_text(encoding='utf-8')
         except Exception as e:
             return False, str(e)

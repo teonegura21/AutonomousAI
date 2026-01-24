@@ -1,140 +1,46 @@
-# AI Autonom Enhanced Sandbox Container
-# Full-featured isolated environment for agent code execution
-# All tools available to agents for task completion
+# AI Autonom Sandbox Container (Lightweight)
+# Minimal Ubuntu base - install tools on demand
 
-FROM python:3.11-slim
+FROM ubuntu:24.04
 
 LABEL maintainer="AI_Autonom"
 LABEL description="Enhanced sandbox for multi-agent AI system"
 
 # Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies and development tools
+# Install minimal runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Build tools
-    gcc \
-    g++ \
-    make \
-    cmake \
-    # Version control
-    git \
-    # Network tools
-    curl \
-    wget \
-    netcat-openbsd \
-    dnsutils \
-    iputils-ping \
-    # Text processing
-    jq \
-    vim-tiny \
-    # Archive tools
-    zip \
-    unzip \
-    # Process tools
-    procps \
-    htop \
-    # File tools
-    tree \
-    less \
-    # SQLite
-    sqlite3 \
-    # SSL/TLS
+    python3 \
+    python3-venv \
+    python3-pip \
+    python-is-python3 \
     ca-certificates \
-    openssl \
-    # Locales
-    locales \
-    && rm -rf /var/lib/apt/lists/* \
-    && locale-gen en_US.UTF-8
-
-ENV LANG=en_US.UTF-8
-ENV LC_ALL=en_US.UTF-8
-
-# Install comprehensive Python packages for agent tasks
-RUN pip install --no-cache-dir \
-    # Web & HTTP
-    requests \
-    httpx \
-    aiohttp \
-    beautifulsoup4 \
-    lxml \
-    selenium \
-    playwright \
-    # Data processing
-    pandas \
-    numpy \
-    polars \
-    # Testing
-    pytest \
-    pytest-cov \
-    pytest-asyncio \
-    hypothesis \
-    # CLI & formatting
-    rich \
-    click \
-    typer \
-    tabulate \
-    # Config & serialization
-    pyyaml \
-    toml \
-    python-dotenv \
-    pydantic \
-    # Database
-    sqlalchemy \
-    aiosqlite \
-    # Async
-    asyncio \
-    anyio \
-    # Text processing
-    regex \
-    chardet \
-    # File handling
-    pathlib2 \
-    watchdog \
-    # Security analysis (read-only)
-    bandit \
-    safety \
-    # Code quality
-    black \
-    isort \
-    flake8 \
-    pylint \
-    mypy \
-    # Documentation
-    sphinx \
-    mkdocs \
-    # API development
-    fastapi \
-    uvicorn \
-    # Utilities
-    tqdm \
-    loguru \
-    arrow \
-    humanize
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create workspace and output directories
 WORKDIR /workspace
 RUN mkdir -p /workspace /outputs /tools /tmp/agent
 
-# Create non-root user for security
-RUN useradd -m -s /bin/bash -u 1000 agent && \
-    chown -R agent:agent /workspace /outputs /tools /tmp/agent
+# Create non-root user for security (reuse UID 1000 if it exists)
+RUN if ! getent passwd 1000 >/dev/null; then \
+        useradd -m -s /bin/bash -u 1000 agent; \
+    fi && \
+    chown -R 1000:1000 /workspace /outputs /tools /tmp/agent
 
 # Copy tool scripts (will be mounted in production)
 COPY --chown=agent:agent docker/tools/ /tools/
 
 # Switch to non-root user
-USER agent
+USER 1000:1000
 
 # Set Python path
 ENV PYTHONPATH=/workspace:/tools
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "print('healthy')" || exit 1
+    CMD python3 -c "print('healthy')" || exit 1
 
 # Default command - keep container running
 CMD ["tail", "-f", "/dev/null"]

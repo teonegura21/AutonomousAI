@@ -1,0 +1,47 @@
+agents:
+  coder:
+    id: openmanus_coder
+    prompt: openmanus:app.prompt.swe
+    tools:
+      - filesystem_read
+      - filesystem_write
+      - filesystem_search
+      - filesystem_list
+      - bash_exec
+      - python_exec
+      - pytest_run
+  researcher:
+    id: openmanus_researcher
+    prompt: openmanus:app.prompt.manus
+    tools:
+      - web_search
+      - web_fetch
+      - filesystem_read
+      - filesystem_write
+  security:
+    id: cai_red_team
+    prompt: cai:system_red_team_agent
+    tools:
+      - generic_linux_command
+      - nmap_scan
+      - netcat
+      - filesystem_read
+      - filesystem_write
+      - capture_remote_traffic
+  web_pentester:
+    id: cai_web_pentester
+    prompt: cai:system_web_pentester
+    tools:
+      - generic_linux_command
+      - curl_request
+      - web_spider
+      - js_surface_mapper
+      - web_request_framework
+      - shodan_search
+  reporter:
+    id: cai_reporter
+    prompt: cai:system_reporting_agent
+    tools:
+      - filesystem_read
+      - filesystem_write
+      - record_finding

@@ -138,7 +138,8 @@ def get_cai_security_agents() -> List[AgentDefinition]:
             id="red_team_agent",
             name="Red Team Agent",
             description="Specialized red teamer for system penetration and privilege escalation",
-            model_name="qwen3:1.7b",  # Default model, can be overridden
+            model_name="qwen2.5-coder:7b",
+            model_size_gb=4.7,
             capabilities=["red_teaming", "penetration_testing", "exploitation", "privilege_escalation"],
             tools=[
                 "cai_generic_linux_command", "cai_nmap_scan", "cai_netcat",
@@ -156,7 +157,8 @@ def get_cai_security_agents() -> List[AgentDefinition]:
             id="web_pentester_agent",
             name="Web App Pentester",
             description="Expert in web application and API penetration testing",
-            model_name="qwen3:1.7b",
+            model_name="qwen2.5-coder:7b",
+            model_size_gb=1.8,
             capabilities=["web_hacking", "api_testing", "injection_attacks", "reconnaissance"],
             tools=[
                 "cai_generic_linux_command", "cai_curl_request", "cai_web_spider",
@@ -175,6 +177,7 @@ def get_cai_security_agents() -> List[AgentDefinition]:
             name="Security Reporter",
             description="Generates professional security assessment reports",
             model_name="dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0", # Good for text generation
+            model_size_gb=1.8,
             capabilities=["reporting", "documentation", "summarization"],
             tools=[
                 "cai_filesystem_read", "cai_filesystem_write", "cai_generic_linux_command"

@@ -15,7 +15,7 @@ REVERSE_ENGINEERING_AGENT = {
     "category": "REVERSE",
     "description": """Expert in binary analysis, firmware examination, and code decompilation.
                    Uses Kali Linux tools for static and dynamic analysis.""",
-    "model": "qwen3:1.7b",
+    "model": "qwen2.5-coder:7b",
     "role": "execution",
     "capabilities": [
         "binary_analysis", "firmware_extraction", "code_decompilation",
@@ -61,7 +61,7 @@ DECOMPILING_ANALYSIS_AGENT = {
     "category": "REVERSE",
     "description": """Specialized in decompiling binaries to high-level code.
                    Expert in Ghidra, IDA patterns, and code reconstruction.""",
-    "model": "qwen3:1.7b",
+    "model": "qwen2.5-coder:7b",
     "role": "execution",
     "capabilities": [
         "decompilation", "code_reconstruction", "function_analysis",
@@ -107,7 +107,7 @@ DFIR_AGENT = {
     "category": "FORENSICS",
     "description": """Digital Forensics and Incident Response specialist.
                    Expert in memory, disk, and network forensics using Kali tools.""",
-    "model": "qwen3:1.7b",
+    "model": "qwen2.5-coder:7b",
     "role": "execution",
     "capabilities": [
         "memory_forensics", "disk_forensics", "network_forensics",
@@ -157,7 +157,7 @@ MEMORY_ANALYSIS_AGENT = {
     "category": "FORENSICS",
     "description": """Expert in memory dump analysis, process examination,
                    and runtime artifact extraction using Volatility.""",
-    "model": "qwen3:1.7b",
+    "model": "qwen2.5-coder:7b",
     "role": "execution",
     "capabilities": [
         "memory_analysis", "process_examination", "malware_detection",
@@ -214,7 +214,7 @@ BUG_BOUNTY_AGENT = {
     "category": "VULNERABILITATI",
     "description": """Expert bug bounty hunter with full Kali Linux toolkit.
                    Specialized in web, API, and network vulnerability discovery.""",
-    "model": "qwen3:1.7b",
+    "model": "qwen2.5-coder:7b",
     "role": "execution",
     "capabilities": [
         "web_security", "api_testing", "vulnerability_discovery",
@@ -275,7 +275,7 @@ THOUGHT_AGENT = {
     "capabilities": [
         "strategic_planning", "task_analysis", "decision_making", "coordination"
     ],
-    "kali_tools": ["python3", "bash"],  # Minimal - planning focused
+    "kali_tools": ["python", "bash"],  # Minimal - planning focused
     "tools": [
         "cai_think", "cai_thought_analysis", 
         "cai_write_key_findings", "cai_read_key_findings"
@@ -314,14 +314,14 @@ CODE_AGENT = {
     "category": "Orchestrator",
     "description": """Expert coder and script developer.
                    Creates tools, exploits, and automation scripts.""",
-    "model": "qwen3:1.7b",
+    "model": "qwen2.5-coder:7b",
     "role": "execution",
     "capabilities": [
         "code_generation", "exploit_development", "automation",
         "debugging", "tool_creation"
     ],
     "kali_tools": [
-        "python3", "perl", "ruby", "bash", "gcc", "make", "git"
+        "python", "perl", "ruby", "bash", "gcc", "make", "git"
     ],
     "tools": [
         "cai_generic_linux_command", "cai_execute_code",
@@ -339,7 +339,7 @@ LANGUAGES AVAILABLE:
 
 DEVELOPMENT WORKFLOW:
 1. Write code to file: Use cai_filesystem_write
-2. Execute: `python3 script.py` or compile and run
+2. Execute: `python script.py` or compile and run
 3. Debug: Check output, add print statements
 4. Iterate until working
 
@@ -364,7 +364,7 @@ REPORTER_AGENT = {
     "category": "RAPORT",
     "description": """Creates professional security assessment reports.
                    Generates documentation in multiple formats.""",
-    "model": "dicta-il/dictalm2.0-instruct:1.7b",
+    "model": "dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0",
     "role": "execution",
     "capabilities": [
         "report_generation", "documentation", "vulnerability_categorization",

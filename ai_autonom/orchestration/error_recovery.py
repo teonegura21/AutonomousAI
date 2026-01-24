@@ -228,7 +228,11 @@ class ErrorRecovery:
     def _get_fallback_model(self, task: Dict) -> str:
         """Get fallback model for a task"""
         # Default fallbacks
-        fallbacks = ["qwen3:1.7b", "phi3:mini", "llama3.2:1b"]
+        fallbacks = [
+            "qwen2.5-coder:7b",
+            "deepseek-r1:7b",
+            "dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0",
+        ]
         current = task.get("assigned_agent", "")
         
         for fb in fallbacks:

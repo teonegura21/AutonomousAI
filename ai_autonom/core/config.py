@@ -88,7 +88,7 @@ class Config:
         """Default configuration when no file exists"""
         return {
             "orchestrator": {
-                "model": "huihui_ai/orchestrator-abliterated",
+                "model": "huihui_ai/orchestrator-abliterated:latest",
                 "max_decomposition_depth": 3,
                 "enable_human_checkpoints": False,
                 "enable_testing": True,
@@ -104,6 +104,7 @@ class Config:
                 "vector_db": {
                     "type": "chromadb",
                     "embedding_model": "nomic-embed-text",
+                    "auto_pull_embeddings": False,
                     "persist_directory": "./.runtime/data/chromadb"
                 },
                 "structured_db": {

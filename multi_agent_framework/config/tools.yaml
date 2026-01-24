@@ -1,0 +1,23 @@
+tools:
+  filesystem:
+    - filesystem_read
+    - filesystem_write
+    - filesystem_search
+    - filesystem_list
+  shell:
+    - bash_exec
+    - generic_linux_command
+  web:
+    - web_search
+    - web_fetch
+    - web_spider
+    - curl_request
+  security:
+    - nmap_scan
+    - netcat
+    - shodan_search
+    - js_surface_mapper
+    - web_request_framework
+    - capture_remote_traffic
+    - record_finding
+    - record_credential

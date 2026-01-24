@@ -223,7 +223,9 @@ class DynamicModelSelector:
             "simple_tasks": "fast",
             "task_decomposition": "reasoning",
             "planning": "reasoning",
-            "analysis": "reasoning"
+            "analysis": "reasoning",
+            "reasoning": "reasoning",
+            "math": "reasoning"
         }
         
         task_type = capability_map.get(capability, "balanced")

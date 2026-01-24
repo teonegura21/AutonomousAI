@@ -14,14 +14,23 @@ import json
 import time
 
 # Add parent directory for imports
+# Add ai_autonom root to path to allow absolute imports
+root_path = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(root_path))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
-    from monitoring.live_executor import get_live_monitor
+    # Try absolute import first (preferred)
+    from ai_autonom.monitoring.live_executor import get_live_monitor
     LIVE_MONITOR_AVAILABLE = True
 except ImportError:
-    LIVE_MONITOR_AVAILABLE = False
-    print("[KALI_EXECUTOR] Live monitor not available - using basic output")
+    try:
+        # Fallback to relative/direct import
+        from monitoring.live_executor import get_live_monitor
+        LIVE_MONITOR_AVAILABLE = True
+    except ImportError as e:
+        LIVE_MONITOR_AVAILABLE = False
+        print(f"[KALI_EXECUTOR] Live monitor not available: {e} - using basic output")
 
 class KaliAgentExecutor:
     """
@@ -30,7 +39,7 @@ class KaliAgentExecutor:
     """
     
     CONTAINER_NAME = "agent_kali"
-    WORKSPACE_DIR = "/workspace"
+    WORKSPACE_DIR = "/"  # Changed from /workspace to / to allow relative paths from root
     
     # Agents that should execute in Kali (all security agents)
     KALI_AGENTS = {
@@ -42,6 +51,9 @@ class KaliAgentExecutor:
         "thought",
         "codeagent",
         "reporter",
+        # Core agents forced to Kali for unified workflow
+        "coder_qwen",
+        "linguistic_dictalm",
         # Also include kali_ prefixed versions
         "kali_reverse_engineering_agent",
         "kali_decompiling_analysis_agent",
@@ -67,6 +79,10 @@ class KaliAgentExecutor:
         except Exception as e:
             print(f"[KALI_EXECUTOR] Docker not available: {e}")
             print("[KALI_EXECUTOR] Agents will run locally. Start Kali: cd docker && docker-compose up -d kali")
+
+    def is_available(self) -> bool:
+        """Return True if Kali container is available for execution."""
+        return self.container is not None
     
     def should_use_kali(self, agent_id: str, tool_id: str) -> bool:
         """
@@ -119,6 +135,11 @@ class KaliAgentExecutor:
         work_path = workdir or self.WORKSPACE_DIR
         
         try:
+            # === TRANSPARENT PATH MAPPING ===
+            # If agent uses 'outputs/...' make it '/outputs/...' for Docker absolute path
+            if "outputs/" in command and not command.startswith("/") and not "/outputs/" in command:
+                command = command.replace("outputs/", "/outputs/")
+                
             # Log command execution
             self._log_command(agent_id, command)
             
@@ -133,9 +154,13 @@ class KaliAgentExecutor:
             start_time = time.time()
             
             # Execute with streaming
+            # Wrap command to tee output to container logs (PID 1 stdout) for visibility
+            # Use pipefail to propagate original exit code
+            wrapped_command = f"set -o pipefail; ({command}) 2>&1 | tee -a /proc/1/fd/1"
+            
             exec_id = self.docker_client.api.exec_create(
                 container=self.container.id,
-                cmd=["bash", "-c", command],
+                cmd=["bash", "-c", wrapped_command],
                 workdir=work_path,
                 environment={
                     "AGENT_ID": agent_id,
@@ -233,7 +258,7 @@ class KaliAgentExecutor:
             return False, f"Failed to write code: {msg}"
         
         # Execute
-        command = f"python3 {self.WORKSPACE_DIR}/{filename}"
+        command = f"python {self.WORKSPACE_DIR}/{filename}"
         return self.execute_in_kali(command, agent_id, timeout)
     
     def write_file(self, filename: str, content: str) -> Tuple[bool, str]:

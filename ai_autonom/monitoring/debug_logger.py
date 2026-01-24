@@ -6,6 +6,7 @@ Dumps raw LLM interactions and Tool outputs to a file for deep inspection.
 
 import os
 import json
+from typing import Optional, Any
 from datetime import datetime
 
 class DebugLogger:

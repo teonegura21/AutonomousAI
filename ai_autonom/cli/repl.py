@@ -1,12 +1,6 @@
-
 """
 AI Autonom REPL (Read-Eval-Print Loop)
-A rich, interactive CLI experience inspired by CAI.
-Features:
-- Persistent Status Bar
-- Autocompletion
-- Syntax Highlighting
-- Rich Output
+Standard, robust CLI interface.
 """
 
 import sys
@@ -14,31 +8,26 @@ import os
 import threading
 from typing import List, Optional
 
-from prompt_toolkit import PromptSession, HTML
-from prompt_toolkit.completion import WordCompleter, NestedCompleter
-from prompt_toolkit.styles import Style
-from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.patch_stdout import patch_stdout
+# Add project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.markdown import Markdown
-from rich.table import Table
-from rich import box
+# Using prompt_toolkit only for input handling (robust)
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import NestedCompleter
+from prompt_toolkit.patch_stdout import patch_stdout
 
 from ai_autonom.orchestration.nemotron_orchestrator import NemotronOrchestrator
 from ai_autonom.memory.knowledge_base import KnowledgeBase
 
 class AutonomREPL:
     def __init__(self):
-        self.console = Console()
         self.kb = KnowledgeBase.get_instance()
         
         # Initialize Orchestrator
         self.orchestrator = NemotronOrchestrator(
             enable_checkpoints=True,
             enable_testing=False,
-            enable_dashboard=False # Disable auto-popup, we control UI here
+            enable_dashboard=True # Enable simple text UI
         )
         
         # Commands
@@ -47,7 +36,6 @@ class AutonomREPL:
             "/status": "Show system status",
             "/agents": "List available agents",
             "/tools": "List available tools",
-            "/clear": "Clear screen",
             "/memory": "Show Knowledge Base (The Blackboard)",
             "/quit": "Exit",
             "/exit": "Exit"
@@ -59,87 +47,64 @@ class AutonomREPL:
             "/status": None,
             "/agents": None,
             "/tools": None,
-            "/clear": None,
             "/memory": None,
             "/quit": None,
-            "/exit": None,
-            "scan": {"target": None},
-            "analyze": None
+            "/exit": None
         })
-        
-        # Style
-        self.style = Style.from_dict({
-            'prompt': 'ansicyan bold',
-            'bottom-toolbar': '#ffffff bg:#333333',
-        })
-
-    def get_bottom_toolbar(self):
-        """Dynamic bottom toolbar"""
-        agents_count = len(self.orchestrator.registry.get_all_agents())
-        kb_findings = len(self.kb.findings)
-        assets = len(self.kb.assets)
-        return HTML(f' <b>AI Autonom</b> | Agents: {agents_count} | Assets: {assets} | Findings: {kb_findings} | <b>/help</b> for commands')
 
     def print_banner(self):
-        self.console.print(Panel(
-            "[bold cyan]AI AUTONOM[/bold cyan]\n"
-            "[dim]Advanced Cyber-Operation Orchestrator[/dim]\n\n"
-            "Type your objective or use [bold]/help[/bold] for commands.",
-            box=box.DOUBLE,
-            border_style="cyan"
-        ))
+        print("\n" + "="*50)
+        print(" AI AUTONOM - COMMAND CENTER")
+        print(" Advanced Cyber-Operation Orchestrator")
+        print("="*50)
+        print(" Type your objective or /help for commands.\n")
 
     def handle_command(self, text: str):
         cmd = text.split()[0].lower()
         
         if cmd == "/help":
-            table = Table(box=box.SIMPLE)
-            table.add_column("Command", style="cyan")
-            table.add_column("Description")
+            print("\nAVAILABLE COMMANDS:")
+            print("-" * 40)
+            print(f"{ 'COMMAND':<15} | {'DESCRIPTION'}")
+            print("-" * 40)
             for c, d in self.commands.items():
-                table.add_row(c, d)
-            self.console.print(table)
+                print(f"{c:<15} | {d}")
+            print()
             
         elif cmd == "/status":
             status = self.orchestrator.get_status()
-            self.console.print(Panel(str(status), title="System Status"))
+            print("\nSYSTEM STATUS:")
+            print(str(status))
+            print()
             
         elif cmd == "/agents":
             agents = self.orchestrator.registry.get_all_agents()
-            table = Table(title="Active Agents", box=box.ROUNDED)
-            table.add_column("ID", style="green")
-            table.add_column("Name")
-            table.add_column("Capabilities", style="dim")
+            print("\nACTIVE AGENTS:")
+            print("-" * 60)
+            print(f"{ 'ID':<20} | {'NAME':<20} | {'CAPABILITIES'}")
+            print("-" * 60)
             for a in agents:
-                table.add_row(a.id, a.name, ", ".join(a.capabilities[:3]))
-            self.console.print(table)
+                caps = ", ".join(a.capabilities[:2])
+                print(f"{a.id:<20} | {a.name:<20} | {caps}...")
+            print()
             
         elif cmd == "/tools":
             tools = self.orchestrator.tool_executor.get_available_tools()
-            self.console.print(f"[bold]Available Tools:[/bold] {len(tools)}")
-            # Show summarized list
-            categories = {}
-            for t in tools:
-                cat = t.get('category', 'misc')
-                if cat not in categories: categories[cat] = []
-                categories[cat].append(t['id'])
+            print(f"\nAVAILABLE TOOLS: {len(tools)}")
             
-            for cat, t_list in categories.items():
-                self.console.print(f"[yellow]{cat.upper()}[/yellow]: {', '.join(t_list)}")
-
         elif cmd == "/memory":
             summary = self.kb.get_summary()
-            self.console.print(Panel(summary, title="🧠 Knowledge Base (Blackboard)", border_style="magenta"))
-            
-        elif cmd == "/clear":
-            self.console.clear()
-            self.print_banner()
+            print("\n🧠 KNOWLEDGE BASE:")
+            print("-" * 40)
+            print(summary)
+            print("-" * 40 + "\n")
             
         elif cmd in ["/quit", "/exit"]:
+            print("Goodbye.")
             sys.exit(0)
             
         else:
-            self.console.print(f"[red]Unknown command: {cmd}[/red]")
+            print(f"Unknown command: {cmd}")
 
     def run(self):
         self.print_banner()
@@ -147,14 +112,9 @@ class AutonomREPL:
         
         while True:
             try:
-                # Use patch_stdout so background threads (dashboard logs) don't mess up the prompt
+                # Use patch_stdout to handle background threads printing gracefully
                 with patch_stdout():
-                    text = session.prompt(
-                        'Autonom> ',
-                        completer=self.completer,
-                        style=self.style,
-                        bottom_toolbar=self.get_bottom_toolbar
-                    ).strip()
+                    text = session.prompt('Autonom> ', completer=self.completer).strip()
                 
                 if not text:
                     continue
@@ -162,8 +122,6 @@ class AutonomREPL:
                 if text.startswith("/"):
                     self.handle_command(text)
                 else:
-                    # Execute Goal
-                    self.console.print(f"[bold green]Executing:[/bold green] {text}")
                     self.orchestrator.run(text)
                     
             except KeyboardInterrupt:
@@ -171,7 +129,7 @@ class AutonomREPL:
             except EOFError:
                 break
             except Exception as e:
-                self.console.print(f"[bold red]Error:[/bold red] {e}")
+                print(f"Error: {e}")
 
 if __name__ == "__main__":
     repl = AutonomREPL()

@@ -6,10 +6,12 @@ Supports multiple LLM providers: Ollama (local), OpenAI, Azure OpenAI, and compa
 """
 
 from typing import Dict, List, Optional, Any
+import threading
 import json
 import time
 import sys
 import os
+import shutil
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -38,12 +40,14 @@ from ai_autonom.tools.code_executor import CodeExecutor
 
 # Orchestration imports
 from ai_autonom.orchestration.intent_analyzer import IntentAnalyzer
+from multi_agent_framework.openmanus.runner import run_toolcall_task
 from ai_autonom.orchestration.agent_messaging import AgentMessageBus, MessageType
-from ai_autonom.orchestration.error_recovery import ErrorRecovery, RecoveryExecutor
+from ai_autonom.orchestration.error_recovery import ErrorRecovery, RecoveryExecutor, RecoveryAction
 from ai_autonom.orchestration.human_checkpoint import HumanCheckpointManager
 from ai_autonom.orchestration.testing_workflow import TestingWorkflow
 from ai_autonom.orchestration.langgraph_workflow import MultiAgentWorkflow, WorkflowState
-from ai_autonom.patterns.handoffs import HandoffManager
+# from ai_autonom.patterns.handoffs import HandoffManager (REPLACED WITH NEW MODULE)
+from ai_autonom.orchestration.handoff_manager import HandoffManager
 from ai_autonom.memory.knowledge_base import KnowledgeBase
 from ai_autonom.core.session_manager import SessionManager
 from ai_autonom.monitoring.debug_logger import log_debug
@@ -60,15 +64,18 @@ except ImportError:
     CAPABILITY_CHECKER_AVAILABLE = False
     CapabilityChecker = None
 
+# IPC Broker for DB-based agent communication
+try:
+    from ai_autonom.orchestration.ipc_broker import get_broker, IPCBroker
+    IPC_AVAILABLE = True
+except ImportError:
+    IPC_AVAILABLE = False
+    get_broker = None
+    IPCBroker = None
+
 # Monitoring imports
 from ai_autonom.monitoring.telemetry import ExecutionMonitor
-from ai_autonom.monitoring.live_dashboard import get_dashboard
-
-try:
-    from ai_autonom.monitoring.live_executor import get_live_monitor
-    LIVE_MONITOR_AVAILABLE = True
-except ImportError:
-    LIVE_MONITOR_AVAILABLE = False
+from ai_autonom.monitoring.ui import get_ui
 
 
 class NemotronOrchestrator:
@@ -93,18 +100,20 @@ class NemotronOrchestrator:
         config_path: str = "config/settings.yaml",
         enable_checkpoints: bool = True,
         enable_testing: bool = True,
-        enable_dashboard: bool = True
+        enable_dashboard: bool = True,
+        cancel_event: Optional[threading.Event] = None
     ):
         # Load configuration
         self.config = Config().load(config_path)
         self.enable_dashboard = enable_dashboard
+        self._refresh_dynamic_models()
         
         if self.enable_dashboard:
-            self.dashboard = get_dashboard()
-            import threading
-            self.dashboard_thread = threading.Thread(target=self.dashboard.start, daemon=True)
+            self.ui = get_ui()
         else:
-            self.dashboard = None
+            self.ui = None
+
+        self.cancel_event = cancel_event or threading.Event()
         
         # Orchestrator LLM settings
         self.orchestrator_model = orchestrator_model or self.config.get(
@@ -124,6 +133,17 @@ class NemotronOrchestrator:
         print(f"\n[ORCHESTRATOR] Initialized")
         print(f"  Model: {self.orchestrator_model}")
         print(f"  Provider: {provider_name}")
+
+    def request_cancel(self) -> None:
+        self.cancel_event.set()
+
+    def _cancelled(self) -> bool:
+        return bool(self.cancel_event and self.cancel_event.is_set())
+
+    def _cancel_result(self) -> Dict[str, Any]:
+        if self.ui:
+            self.ui.log("Cancellation requested. Stopping workflow.", "WARNING")
+        return {"success": False, "error": "Cancelled"}
     
     def _init_providers(self):
         """Initialize LLM providers based on configuration"""
@@ -135,7 +155,7 @@ class NemotronOrchestrator:
             try:
                 config = LLMConfig(
                     provider=ProviderType.OLLAMA,
-                    model=ollama_config.get('default_model', 'qwen3:1.7b'),
+                    model=ollama_config.get('default_model', 'qwen2.5-coder:7b'),
                     api_base=ollama_config.get('api_base')
                 )
                 self.providers['ollama'] = LLMProviderFactory.create(config)
@@ -219,7 +239,18 @@ class NemotronOrchestrator:
         # Model Management
         self.model_discovery = ModelDiscovery()
         self.model_selector = DynamicModelSelector()
-        self.model_watcher = ModelWatcher(self.model_discovery, interval=60)
+        auto_benchmark = self.config.get("ollama_models.auto_benchmark", False)
+        self.model_watcher = ModelWatcher(
+            self.model_discovery,
+            interval=60,
+            auto_benchmark=auto_benchmark,
+            on_new_model=self._on_new_model
+        )
+        self.model_watcher.start()
+
+        # IPC Broker (DB-based inter-agent comms)
+        self.ipc: Optional[IPCBroker] = get_broker() if IPC_AVAILABLE else None
+        self.ipc_enabled = self.ipc is not None
         
         # Memory Systems
         self.task_memory = TaskMemory()
@@ -227,17 +258,22 @@ class NemotronOrchestrator:
         self.knowledge_base = KnowledgeBase.get_instance()
         
         # Tools
-        self.tool_executor = ToolExecutor(workspace_dir="outputs")
+        require_kali = self.config.get('execution.require_kali_for_security', True)
+        self.tool_executor = ToolExecutor(
+            workspace_dir="outputs",
+            require_kali_for_security=require_kali
+        )
         self.code_executor = CodeExecutor(workspace_dir="outputs")
         
         # Orchestration Components
         self.intent_analyzer = IntentAnalyzer()
         self.message_bus = AgentMessageBus()
-        self.error_recovery = ErrorRecovery(max_retries=3)
+        max_retries = self.config.get("execution.max_retries", 3)
+        self.error_recovery = ErrorRecovery(max_retries=max_retries)
         self.checkpoint = HumanCheckpointManager(auto_approve_low_risk=not enable_checkpoints)
         self.testing_workflow = TestingWorkflow()
         self.workflow_engine = MultiAgentWorkflow(orchestrator=self)
-        self.handoff_manager = HandoffManager(self.registry)
+        self.handoff_manager = HandoffManager(self.registry, self.knowledge_base)
         self.session_manager = SessionManager()
         
         # Monitoring
@@ -245,19 +281,704 @@ class NemotronOrchestrator:
         
         # State
         self.current_workflow_id = None
+        self.current_plan: List[Dict[str, Any]] = []
+        self.workflow_paused = False
         self.enable_testing = enable_testing
         self.enable_checkpoints = enable_checkpoints
+        self.session_workspace: Optional[str] = None
         
+        # Auto-pull Ollama models if configured
+        self._ensure_ollama_models()
+
         # Setup registry after all components are initialized
         self._setup_registry()
+
+    def start_session(self, user_goal: str) -> str:
+        """Create a session workspace and configure tools to use it."""
+        session_path = self.session_manager.create_session(user_goal)
+        self._configure_session_workspace(session_path)
+        if self.ui:
+            try:
+                self.ui.set_session(
+                    self.session_manager.current_session_id,
+                    self.session_manager.current_session_dir,
+                )
+            except Exception:
+                pass
+        return session_path
+
+    def attach_session(self, session_dir: str) -> str:
+        """Attach to an existing session workspace without creating a new folder."""
+        session_path = Path(session_dir)
+        session_path.mkdir(parents=True, exist_ok=True)
+        for folder in ("src", "bin", "docs", "memory"):
+            (session_path / folder).mkdir(parents=True, exist_ok=True)
+
+        self.session_manager.current_session_dir = str(session_path)
+        self.session_manager.current_session_id = session_path.name
+        self._configure_session_workspace(str(session_path))
+        if self.ui:
+            try:
+                self.ui.set_session(
+                    self.session_manager.current_session_id,
+                    self.session_manager.current_session_dir,
+                )
+            except Exception:
+                pass
+        return str(session_path)
+
+    def _configure_session_workspace(self, session_path: str) -> None:
+        workspace = Path(session_path)
+        workspace.mkdir(parents=True, exist_ok=True)
+        self.session_workspace = workspace.as_posix()
+
+        os.environ["AI_AUTONOM_WORKSPACE"] = str(workspace)
+        os.environ["AI_AUTONOM_WORKSPACE_NAME"] = workspace.name
+
+        self.tool_executor.set_workspace(str(workspace))
+        if hasattr(self.code_executor, "set_workspace"):
+            self.code_executor.set_workspace(str(workspace))
+        else:
+            self.code_executor.workspace_dir = str(workspace)
+
+    def _persist_session_artifacts(
+        self,
+        user_goal: str,
+        tasks: List[Dict[str, Any]],
+        results: List[Dict[str, Any]],
+    ) -> None:
+        session_dir = self.session_manager.current_session_dir
+        if not session_dir:
+            return
+
+        session_path = Path(session_dir)
+        docs_dir = session_path / "docs"
+        memory_dir = session_path / "memory"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        memory_dir.mkdir(parents=True, exist_ok=True)
+
+        def trim(text: str, limit: int = 2500) -> str:
+            if not text:
+                return ""
+            return text[:limit] + ("..." if len(text) > limit else "")
+
+        success_count = sum(1 for r in results if r.get("success"))
+        snapshot = {
+            "goal": user_goal,
+            "workflow_id": self.current_workflow_id,
+            "created_at": datetime.now().isoformat(),
+            "tasks_total": len(tasks),
+            "tasks_successful": success_count,
+            "tasks_failed": len(tasks) - success_count,
+            "outputs": [],
+        }
+
+        try:
+            snapshot["outputs"] = self.task_memory.get_all_outputs(self.current_workflow_id)
+        except Exception:
+            pass
+
+        try:
+            self.task_memory.export_workflow_db(
+                str(memory_dir / "task_memory_session.db"),
+                self.current_workflow_id,
+            )
+        except Exception:
+            pass
+
+        try:
+            self._write_memory_json("task_outputs.json", snapshot, versioned=True)
+        except Exception:
+            pass
+
+        try:
+            kb_path = Path(self.knowledge_base.db_path)
+            if kb_path.exists():
+                shutil.copyfile(kb_path, memory_dir / "knowledge_base.json")
+        except Exception:
+            pass
+
+        try:
+            vector_stats = self.vector_store.get_stats()
+            with open(memory_dir / "vector_stats.json", "w", encoding="utf-8") as f:
+                json.dump(vector_stats, f, indent=2, ensure_ascii=True)
+        except Exception:
+            pass
+
+        try:
+            vector_snapshot = {}
+            for task in tasks:
+                task_id = task.get("id")
+                if not task_id:
+                    continue
+                context = self.vector_store.get_task_context(task_id)
+                trimmed_context = {}
+                for key, items in context.items():
+                    trimmed_context[key] = [
+                        {
+                            "content": trim(item.get("content", ""), 2500),
+                            "metadata": item.get("metadata", {}),
+                        }
+                        for item in items
+                    ]
+                if any(trimmed_context.values()):
+                    vector_snapshot[task_id] = trimmed_context
+
+            if vector_snapshot:
+                with open(
+                    memory_dir / "vector_context.json",
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(vector_snapshot, f, indent=2, ensure_ascii=True)
+        except Exception:
+            pass
+
+        summary_path = memory_dir / "summary.md"
+        if not summary_path.exists():
+            kb_summary = self.knowledge_base.get_summary().strip()
+            summary_lines = [
+                "# Session Memory Summary",
+                "",
+                f"Goal: {user_goal}",
+                f"Session: {self.session_manager.current_session_id}",
+                f"Workflow: {self.current_workflow_id}",
+                f"Status: {success_count}/{len(tasks)} tasks succeeded",
+                "",
+                "Notes:",
+                "- Source code should live in src/.",
+                "- Compiled binaries should live in bin/.",
+                "- Final report should live in docs/.",
+                "- Session notes and snapshots live in memory/.",
+                "- Session DB snapshot: memory/task_memory_session.db",
+                "- Vector snapshot: memory/vector_stats.json",
+                "",
+            ]
+            if kb_summary:
+                summary_lines.extend(["Knowledge Base Summary:", kb_summary, ""])
+            summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+
+        report_path = docs_dir / "final_report.md"
+        report_lines = [
+            "# AI Autonom Session Report",
+            "",
+            f"Goal: {user_goal}",
+            f"Session: {self.session_manager.current_session_id}",
+            f"Workflow: {self.current_workflow_id}",
+            f"Status: {success_count}/{len(tasks)} tasks succeeded",
+            "",
+            "## Plan",
+        ]
+        for task in tasks:
+            task_id = task.get("id", "task")
+            description = trim(task.get("description", ""), 200)
+            report_lines.append(f"- {task_id}: {description}")
+
+        report_lines.extend(["", "## Results"])
+        for result in results:
+            agent = result.get("agent", "unknown")
+            status = "SUCCESS" if result.get("success") else "FAILED"
+            output = trim(result.get("output", ""), 1000)
+            report_lines.append(f"- {agent}: {status}")
+            if output:
+                report_lines.append(f"  Output: {output}")
+
+        report_lines.extend(
+            [
+                "",
+                "## Artifacts",
+                f"- Source code: {session_path / 'src'}",
+                f"- Binaries: {session_path / 'bin'}",
+                f"- Docs: {session_path / 'docs'}",
+                f"- Memory: {session_path / 'memory'}",
+                "",
+                "## Instructions",
+                "- Review memory/intent_analysis.json for the structured plan summary.",
+                "- Review memory/task_briefs.json for recommended tools per task.",
+                "- If a task failed, inspect full_orchestration_log.txt for the tool error.",
+            ]
+        )
+
+        report_content = "\n".join(report_lines)
+        report_path.write_text(report_content, encoding="utf-8")
+        if self.current_workflow_id:
+            versioned_path = docs_dir / f"final_report_{self.current_workflow_id}.md"
+            versioned_path.write_text(report_content, encoding="utf-8")
+        if self.ui:
+            try:
+                self.ui.set_final_report(
+                    {
+                        "path": str(report_path),
+                        "content": trim(report_content, 2500),
+                    }
+                )
+            except Exception:
+                pass
+
+    def _write_memory_json(
+        self,
+        filename: str,
+        payload: Dict[str, Any],
+        versioned: bool = False,
+    ) -> None:
+        session_dir = self.session_manager.current_session_dir
+        if not session_dir:
+            return
+        memory_dir = Path(session_dir) / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(memory_dir / filename, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=True)
+        except Exception:
+            pass
+        if versioned and self.current_workflow_id:
+            try:
+                base = Path(filename)
+                versioned_name = f"{base.stem}_{self.current_workflow_id}{base.suffix}"
+                with open(memory_dir / versioned_name, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=True)
+            except Exception:
+                pass
+
+    def _build_task_briefs(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        briefs: List[Dict[str, Any]] = []
+        agents = self.registry.get_all_agents()
+        agent_map = {agent.id: agent for agent in agents}
+        max_iterations = int(self.config.get("execution.max_tool_iterations", 3))
+
+        for task in tasks:
+            task_id = task.get("id")
+            assigned_id = task.get("assigned_agent")
+            agent = agent_map.get(assigned_id)
+            model = None
+            if agent:
+                model = self._select_model_for_task(task, agent)
+
+            tools = task.get("tools", []) or []
+            recommended_steps = [
+                "Write source files under src/ using filesystem_write.",
+                "Execute code using python_exec or bash_exec.",
+            ]
+            if "pytest_run" in tools:
+                recommended_steps.append("Run tests with pytest_run.")
+            if task.get("type") == "documentation":
+                recommended_steps.append("Save the report in docs/.")
+
+            briefs.append(
+                {
+                    "task_id": task_id,
+                    "description": task.get("description", ""),
+                    "assigned_agent": assigned_id,
+                    "recommended_model": model,
+                    "recommended_tools": tools,
+                    "recommended_steps": recommended_steps,
+                    "max_tool_iterations": max_iterations,
+                }
+            )
+
+        return briefs
+    def _on_new_model(self, capabilities: Dict[str, Any]) -> None:
+        """Refresh dynamic models and registry when new models appear."""
+        self._refresh_dynamic_models()
+        try:
+            from ai_autonom.core.agent_registry import setup_initial_registry
+            setup_initial_registry()
+        except Exception:
+            pass
+        self._setup_registry()
+
+    def _refresh_dynamic_models(self) -> None:
+        """Sync Ollama models and pick best defaults for core roles."""
+        try:
+            discovery = ModelDiscovery()
+            auto_register = self.config.get('ollama_models.auto_register', True)
+            auto_benchmark = self.config.get('ollama_models.auto_benchmark', False)
+            sync = discovery.sync_ollama_models(auto_register=auto_register, auto_benchmark=auto_benchmark)
+            available = {m for m in set(sync.get("available", [])) if not discovery.is_embedding_model(m)}
+            if not available:
+                self._available_models = set()
+                print("[ORCHESTRATOR] No Ollama models available; keeping configured defaults")
+                return
+            self._available_models = set(available)
+
+            selector = DynamicModelSelector()
+            max_vram = self.config.get("execution.vram_limit_gb", 20)
+
+            def pick_model(task_type: str, config_key: str, fallback: str) -> str:
+                preferred = self.config.get(config_key)
+                if preferred and preferred in available:
+                    return preferred
+                best = selector.select_best_model(task_type, {"max_vram": max_vram})
+                if isinstance(best, dict) and best.get("model_name") in available:
+                    return best["model_name"]
+                if available:
+                    return sorted(available)[0]
+                return fallback
+
+            coder_model = pick_model("coding", "agents.coder.model", "qwen2.5-coder:7b")
+            doc_model = pick_model("documentation", "agents.linguistic.model", coder_model)
+            orchestrator_model = pick_model("reasoning", "orchestrator.model", coder_model)
+
+            self.config.set("agents.coder.model", coder_model)
+            self.config.set("agents.linguistic.model", doc_model)
+            self.config.set("orchestrator.model", orchestrator_model)
+            self.config.set("providers.ollama.default_model", coder_model)
+        except Exception as e:
+            self._available_models = set()
+            print(f"[ORCHESTRATOR] Dynamic model refresh failed: {e}")
+
+    def _ensure_ollama_models(self) -> None:
+        """Auto-pull and register configured Ollama models."""
+        ollama_cfg = self.config.get('ollama_models', {})
+        if not ollama_cfg or not ollama_cfg.get('auto_pull', False):
+            return
+
+        model_lists: List[str] = []
+        for key in ("coding_models", "linguistic_models", "reasoning_models"):
+            model_lists.extend(ollama_cfg.get(key, []) or [])
+
+        if not model_lists:
+            return
+
+        auto_register = ollama_cfg.get('auto_register', True)
+        auto_benchmark = ollama_cfg.get('auto_benchmark', True)
+
+        self.model_discovery.ensure_models(
+            model_lists,
+            auto_register=auto_register,
+            auto_benchmark=auto_benchmark,
+            pull_missing=True
+        )
+
+    def _select_model_for_capability(self, capability: str, fallback: str) -> str:
+        """Select best available model for a capability, with fallback."""
+        try:
+            task_type = self._capability_to_task_type(capability)
+            preferred = self._select_preferred_model(task_type)
+            if preferred:
+                return preferred
+            max_vram = self.config.get('execution.vram_limit_gb', 20)
+            best = self.model_selector.get_model_for_capability(capability, max_vram=max_vram)
+            return best or fallback
+        except Exception:
+            return fallback
+
+    def _capability_to_task_type(self, capability: Optional[str]) -> str:
+        cap = (capability or "").lower()
+        coding_caps = {"code_generation", "debugging", "testing", "refactoring", "python", "technical_tasks"}
+        doc_caps = {"documentation", "summarization", "text_generation", "formatting", "explanation"}
+        reason_caps = {"task_decomposition", "planning", "analysis", "reasoning", "math"}
+        fast_caps = {"simple_tasks"}
+
+        if cap in coding_caps:
+            return "coding"
+        if cap in doc_caps:
+            return "documentation"
+        if cap in reason_caps:
+            return "reasoning"
+        if cap in fast_caps:
+            return "fast"
+        return "balanced"
+
+    def _select_preferred_model(self, task_type: str) -> Optional[str]:
+        """Pick a preferred model for a task type from config if available."""
+        model_lists = {
+            "coding": self.config.get("ollama_models.coding_models", []) or [],
+            "documentation": self.config.get("ollama_models.linguistic_models", []) or [],
+            "reasoning": self.config.get("ollama_models.reasoning_models", []) or [],
+        }
+        preferred_list = model_lists.get(task_type, [])
+        if not preferred_list:
+            return None
+
+        available = getattr(self, "_available_models", None)
+        if not available:
+            try:
+                available = {
+                    m.get("name")
+                    for m in self.model_discovery.scan_ollama_models()
+                    if m.get("name")
+                }
+            except Exception:
+                available = set()
+
+        for model_name in preferred_list:
+            if not available or model_name in available:
+                return model_name
+        return None
+
+    def _infer_capability_from_description(self, description: str) -> Optional[str]:
+        if not description:
+            return None
+        desc = description.lower()
+        if any(token in desc for token in ("analy", "reason", "logic", "math", "prove", "derive", "calculate")):
+            return "analysis"
+        if any(token in desc for token in ("document", "summar", "report", "explain", "format")):
+            return "documentation"
+        if any(token in desc for token in ("implement", "code", "build", "fix", "debug", "refactor", "test")):
+            return "code_generation"
+        return None
+
+    def _select_model_for_task(self, task: Dict[str, Any], agent: AgentDefinition) -> str:
+        override = task.get("model_override")
+        if override:
+            return override
+        capability = task.get("required_capability") or self._infer_capability_from_description(
+            task.get("description", "")
+        )
+        if not capability:
+            return agent.model_name
+        return self._select_model_for_capability(capability, agent.model_name)
+
+    def _is_security_agent_id(self, agent_id: Optional[str]) -> bool:
+        if not agent_id:
+            return False
+        agent_id = agent_id.lower()
+        markers = [
+            "red_team",
+            "pentester",
+            "security",
+            "kali",
+            "cai",
+            "dfir",
+            "bug_bounty",
+            "recon",
+        ]
+        return any(marker in agent_id for marker in markers)
+
+    def _sanitize_task_tools(self, tasks: List[Dict[str, Any]]) -> None:
+        """Remove cai_* tools from non-security tasks and set sane defaults."""
+        replacements = {
+            "cai_generic_linux_command": "bash_exec",
+            "cai_execute_code": "python_exec",
+            "cai_filesystem_read": "filesystem_read",
+            "cai_filesystem_write": "filesystem_write",
+            "cai_filesystem_search": "filesystem_search",
+        }
+        for task in tasks:
+            agent_id = task.get("assigned_agent")
+            if self._is_security_agent_id(agent_id):
+                continue
+
+            tools = list(task.get("tools", []) or [])
+            cleaned: List[str] = []
+            for tool_id in tools:
+                if tool_id.startswith("cai_"):
+                    replacement = replacements.get(tool_id)
+                    if replacement:
+                        cleaned.append(replacement)
+                    continue
+                cleaned.append(tool_id)
+
+            cleaned = list(dict.fromkeys(cleaned))
+            if not cleaned:
+                capability = (task.get("required_capability") or "").lower()
+                if capability in {"documentation", "summarization", "formatting", "explanation"}:
+                    cleaned = ["filesystem_read", "filesystem_write"]
+                elif capability in {"research", "information_gathering"}:
+                    cleaned = ["web_search", "web_fetch", "filesystem_read", "filesystem_write"]
+                else:
+                    cleaned = ["filesystem_read", "filesystem_write", "bash_exec", "python_exec"]
+
+            task["tools"] = cleaned
+
+    def _estimate_model_vram(self, model_name: str) -> float:
+        try:
+            return self.model_discovery._estimate_vram(model_name)
+        except Exception:
+            return 4.0
+
+    def _get_ipc_dependency_context(self, dependencies: List[str]) -> Dict[str, Any]:
+        """Fetch dependency outputs from IPC shared context (DB)."""
+        if not self.ipc_enabled or not dependencies:
+            return {}
+
+        context: Dict[str, Any] = {}
+        for dep_id in dependencies:
+            output = self.ipc.get_shared(f"task:{dep_id}:output")
+            if output:
+                context[dep_id] = {"output": output}
+        return context
+
+    def _publish_task_output(self, task_id: str, output: str, agent_name: str) -> None:
+        """Publish task outputs to IPC shared context (DB)."""
+        if not self.ipc_enabled:
+            return
+
+        summary = output[:2000] if output else ""
+        self.ipc.set_shared(f"task:{task_id}:output", output)
+        self.ipc.set_shared(f"task:{task_id}:summary", summary)
+        self.ipc.publish("task_completed", {
+            "task_id": task_id,
+            "agent": agent_name,
+            "summary": summary,
+            "timestamp": datetime.now().isoformat()
+        })
+
+        if self.ui:
+            self.ui.log(f"IPC: task_completed: {task_id} ({agent_name})", "INFO")
+
+    def _ensure_sequential_dependencies(self, tasks: List[Dict[str, Any]]) -> None:
+        """Ensure each task depends on the previous one if no dependencies are set."""
+        prev_task_id = None
+        for task in tasks:
+            deps = task.get("dependencies") or []
+            if prev_task_id and not deps:
+                task["dependencies"] = [prev_task_id]
+            prev_task_id = task.get("id") or prev_task_id
+
+    def _update_plan_storage(self, tasks: List[Dict[str, Any]]) -> None:
+        """Persist plan to DB + IPC for this conversation."""
+        if self.current_workflow_id:
+            self.task_memory.save_workflow_plan(self.current_workflow_id, tasks)
+        if self.ipc_enabled and self.current_workflow_id:
+            self.ipc.set_shared(f"workflow:{self.current_workflow_id}:plan", tasks)
+            self.ipc.publish("workflow_plan_updated", {
+                "workflow_id": self.current_workflow_id,
+                "task_count": len(tasks),
+                "timestamp": datetime.now().isoformat()
+            })
+            if self.ui:
+                self.ui.log("IPC: workflow_plan_updated", "INFO")
+
+    def _handle_control_command(self, command: str, tasks: List[Dict[str, Any]]) -> str:
+        """Handle workflow control commands and update plan/DB."""
+        parts = command.strip().split()
+        if not parts:
+            return "Empty command"
+
+        cmd = parts[0].lower()
+
+        if cmd == "help":
+            return "Commands: resume | pause | stop | list | set | assign | deps | move | insert | remove | swap"
+
+        if cmd == "pause":
+            self.workflow_paused = True
+            return "Workflow paused"
+
+        if cmd == "resume":
+            self.workflow_paused = False
+            return "Workflow resumed"
+
+        if cmd == "stop":
+            self.workflow_paused = True
+            return "Workflow stopped"
+
+        if cmd == "list":
+            return ", ".join([f"{t.get('id')}:{t.get('assigned_agent')}" for t in tasks]) or "No tasks"
+
+        if cmd == "set" and len(parts) >= 4 and parts[2].lower() == "desc":
+            task_id = parts[1]
+            desc = " ".join(parts[3:]).strip()
+            for t in tasks:
+                if t.get("id") == task_id:
+                    t["description"] = desc
+                    self.task_memory.update_task_definition(task_id, description=desc)
+                    self._update_plan_storage(tasks)
+                    return f"Updated description for {task_id}"
+            return f"Task not found: {task_id}"
+
+        if cmd == "assign" and len(parts) >= 3:
+            task_id = parts[1]
+            agent_id = parts[2]
+            for t in tasks:
+                if t.get("id") == task_id:
+                    t["assigned_agent"] = agent_id
+                    self.task_memory.update_task_definition(task_id, assigned_agent=agent_id)
+                    self._update_plan_storage(tasks)
+                    return f"Assigned {task_id} to {agent_id}"
+            return f"Task not found: {task_id}"
+
+        if cmd == "deps" and len(parts) >= 3:
+            task_id = parts[1]
+            deps = parts[2].split(",") if parts[2] else []
+            for t in tasks:
+                if t.get("id") == task_id:
+                    t["dependencies"] = deps
+                    self.task_memory.update_task_dependencies(task_id, deps)
+                    self._update_plan_storage(tasks)
+                    return f"Updated dependencies for {task_id}"
+            return f"Task not found: {task_id}"
+
+        if cmd == "move" and len(parts) >= 4:
+            task_id = parts[1]
+            position = parts[2].lower()
+            ref_id = parts[3]
+            task = next((t for t in tasks if t.get("id") == task_id), None)
+            ref = next((t for t in tasks if t.get("id") == ref_id), None)
+            if not task or not ref:
+                return "Task or reference not found"
+            tasks.remove(task)
+            ref_index = tasks.index(ref)
+            insert_index = ref_index if position == "before" else ref_index + 1
+            tasks.insert(insert_index, task)
+            self._ensure_sequential_dependencies(tasks)
+            self._update_plan_storage(tasks)
+            return f"Moved {task_id} {position} {ref_id}"
+
+        if cmd == "insert" and len(parts) >= 5:
+            after_id = parts[1]
+            new_id = parts[2]
+            agent_id = parts[3]
+            desc = " ".join(parts[4:]).strip()
+            new_task = {
+                "id": new_id,
+                "description": desc,
+                "assigned_agent": agent_id,
+                "tools": [],
+                "dependencies": []
+            }
+            if after_id == "start":
+                tasks.insert(0, new_task)
+            else:
+                ref = next((t for t in tasks if t.get("id") == after_id), None)
+                if not ref:
+                    return f"Reference task not found: {after_id}"
+                idx = tasks.index(ref)
+                tasks.insert(idx + 1, new_task)
+            self._ensure_sequential_dependencies(tasks)
+            self._update_plan_storage(tasks)
+            return f"Inserted {new_id} after {after_id}"
+
+        if cmd == "remove" and len(parts) >= 2:
+            task_id = parts[1]
+            task = next((t for t in tasks if t.get("id") == task_id), None)
+            if not task:
+                return f"Task not found: {task_id}"
+            tasks.remove(task)
+            self._ensure_sequential_dependencies(tasks)
+            self._update_plan_storage(tasks)
+            return f"Removed {task_id}"
+
+        if cmd == "swap" and len(parts) >= 3:
+            t1 = next((t for t in tasks if t.get("id") == parts[1]), None)
+            t2 = next((t for t in tasks if t.get("id") == parts[2]), None)
+            if not t1 or not t2:
+                return "Task not found"
+            i1, i2 = tasks.index(t1), tasks.index(t2)
+            tasks[i1], tasks[i2] = tasks[i2], tasks[i1]
+            self._ensure_sequential_dependencies(tasks)
+            self._update_plan_storage(tasks)
+            return f"Swapped {parts[1]} and {parts[2]}"
+
+        return "Unknown command"
     
     def _setup_registry(self):
         """Register default execution agents"""
+        try:
+            from ai_autonom.core.agent_registry import setup_initial_registry
+            setup_initial_registry()
+        except Exception:
+            pass
+        config = get_config()
+        coder_model = config.get('agents.coder.model', 'qwen2.5-coder:7b')
+        linguistic_model = config.get('agents.linguistic.model', 'dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0')
+
         # CAI Retester Agent
         self.registry.register_agent(AgentDefinition(
             id="retester_agent",
             name="Retester Agent",
-            model_name="alias1", # Will fallback to config default if not available
+            model_name=coder_model,
             model_size_gb=0.0,
             capabilities=["vulnerability_verification", "triage", "false_positive_elimination"],
             tools=["cai_generic_linux_command", "python_exec", "cai_google_search"],
@@ -265,7 +986,7 @@ class NemotronOrchestrator:
             speed_tokens_per_sec=50.0,
             quality_score=95.0,
             description="Specialist in validating vulnerabilities and eliminating false positives",
-            provider="openai", # Assume alias1/openai compatible
+            provider="ollama",
             system_prompt="""# Cybersecurity Triage Agent
 
 You are an autonomous cybersecurity agent specializing in vulnerability 
@@ -346,33 +1067,39 @@ exploitability, eliminating uncertainty and enabling informed security
 decision-making."""
         ))
 
-        # Technical/Coding agent - Qwen3 1.7B (Ollama)
+        # Technical/Coding agent - auto-select best coding model if available
+        coder_fallback = self.config.get('agents.coder.model', 'qwen2.5-coder:7b')
+        coder_model = self._select_model_for_capability("code_generation", coder_fallback)
+        coder_vram = self._estimate_model_vram(coder_model)
         self.registry.register_agent(AgentDefinition(
             id="coder_qwen",
             name="Qwen3 Technical Coder",
-            model_name="qwen3:1.7b",
-            model_size_gb=1.4,
+            model_name=coder_model,
+            model_size_gb=coder_vram,
             capabilities=["code_generation", "debugging", "refactoring", "python", "testing", "technical_tasks"],
             tools=["filesystem_read", "filesystem_write", "python_exec", "bash_exec", "pytest_run"],
-            vram_required=1.4,
+            vram_required=coder_vram,
             speed_tokens_per_sec=70.0,
             quality_score=85.0,
-            description="1.7B general purpose coder - fast and technical",
+            description="Auto-selected coder model for technical tasks",
             provider="ollama"
         ))
         
-        # Linguistic/Simple tasks agent - DictaLM 1.7B (Ollama)
+        # Linguistic/Simple tasks agent - auto-select best documentation model if available
+        linguistic_fallback = self.config.get('agents.linguistic.model', 'dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0')
+        linguistic_model = self._select_model_for_capability("documentation", linguistic_fallback)
+        linguistic_vram = self._estimate_model_vram(linguistic_model)
         self.registry.register_agent(AgentDefinition(
             id="linguistic_dictalm",
             name="DictaLM Linguistic Agent",
-            model_name="dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0",
-            model_size_gb=1.8,
+            model_name=linguistic_model,
+            model_size_gb=linguistic_vram,
             capabilities=["text_generation", "documentation", "summarization", "formatting", "explanation", "simple_tasks"],
             tools=["filesystem_read", "filesystem_write"],
-            vram_required=1.8,
+            vram_required=linguistic_vram,
             speed_tokens_per_sec=50.0,
             quality_score=80.0,
-            description="1.7B thinking model for text and documentation",
+            description="Auto-selected linguistic model for documentation",
             provider="ollama"
         ))
         
@@ -423,7 +1150,12 @@ decision-making."""
             "enhancement": self.intent_analyzer.get_prompt_enhancement(result)
         }
     
-    def decompose_and_assign(self, user_goal: str, intent_enhancement: str = "") -> List[Dict]:
+    def decompose_and_assign(
+        self,
+        user_goal: str,
+        intent_enhancement: str = "",
+        pattern_name: Optional[str] = None
+    ) -> List[Dict]:
         """
         Nemotron decomposes task AND assigns agents dynamically
         Returns: List of subtasks with assigned agents and tools
@@ -443,11 +1175,28 @@ decision-making."""
         # Get available tools
         tool_info = self.tool_executor.get_tool_descriptions()
         
+        pattern_hint = ""
+        if pattern_name:
+            try:
+                from ai_autonom.patterns.cai_patterns import PatternLibrary
+                pattern = PatternLibrary.get_pattern(pattern_name)
+                if pattern:
+                    seq = pattern.agents or pattern.sequence or []
+                    if seq:
+                        pattern_hint = f"Suggested pattern: {pattern_name} with agent sequence: {', '.join(seq)}. Follow this sequence unless there's a strong reason to deviate."
+                    else:
+                        pattern_hint = f"Suggested pattern: {pattern_name}."
+                else:
+                    pattern_hint = f"Suggested pattern: {pattern_name}."
+            except Exception:
+                pattern_hint = f"Suggested pattern: {pattern_name}."
+
         prompt = f"""You are Nemotron, a meta-orchestrator. You ONLY plan and assign - you NEVER execute.
 
 User Goal: "{user_goal}"
 
 {f'Additional Context: {intent_enhancement}' if intent_enhancement else ''}
+{f'Pattern Guidance: {pattern_hint}' if pattern_hint else ''}
 
 Available Execution Agents:
 {agent_info}
@@ -462,6 +1211,11 @@ Your job:
    - The specific tools needed
 3. Add dependencies between tasks if needed
 4. If user requested a single file output, add a FINAL synthesis task
+
+IMPORTANT: MERGE sequential "Write Code" and "Execute Code" steps into ONE single task.
+- BAD: Task 1: Write file. Task 2: Execute file.
+- GOOD: Task 1: Write AND Execute file.
+- REASON: Persistent state between tasks is not guaranteed.
 
 Return ONLY this JSON format:
 {{
@@ -482,6 +1236,8 @@ Return ONLY this JSON format:
 Rules:
 - Use "coder_qwen" for: code generation, debugging, testing, technical tasks
 - Use "linguistic_dictalm" for: documentation, text, explanations
+- Use "research_agent" for: research, discovery, external context gathering
+- Use "synthesizer_agent" for: final synthesis across multiple task outputs
 - Add dependencies: tasks that need previous task output
 - For multi-file output that needs combining: add final synthesis task
 - Use exact agent IDs and tool IDs"""
@@ -512,6 +1268,13 @@ Rules:
             
             # Add synthesis task if multiple coding tasks and single file requested
             tasks = self._add_synthesis_if_needed(tasks, user_goal)
+
+            # Remove cai_* tools from non-security tasks
+            self._sanitize_task_tools(tasks)
+
+            # Apply pattern ordering/deps if available
+            if pattern_name:
+                tasks = self._apply_pattern_to_tasks(tasks, pattern_name)
             
             print(f"Generated {len(tasks)} tasks\n")
             
@@ -524,11 +1287,86 @@ Rules:
                     print(f"     Deps: {task.get('dependencies')}")
                 print()
             
+            if not tasks and pattern_name:
+                print(f"[FALLBACK] No tasks generated, applying pattern: {pattern_name}")
+                tasks = self._build_tasks_from_pattern(pattern_name, user_goal)
+
             return tasks
             
         except Exception as e:
             print(f"Decomposition failed: {e}")
+            if pattern_name:
+                print(f"[FALLBACK] Using pattern {pattern_name} due to decomposition failure")
+                return self._build_tasks_from_pattern(pattern_name, user_goal)
             return []
+
+    def _build_tasks_from_pattern(self, pattern_name: str, user_goal: str) -> List[Dict]:
+        """Create a basic task list from a predefined pattern."""
+        try:
+            from ai_autonom.patterns.cai_patterns import PatternLibrary, PatternType
+            pattern = PatternLibrary.get_pattern(pattern_name)
+            if not pattern:
+                return []
+
+            tasks: List[Dict] = []
+            agents = pattern.agents or pattern.sequence or []
+            prev_task_id = None
+
+            for idx, agent_id in enumerate(agents, 1):
+                agent = next((a for a in self.registry.get_all_agents() if a.id == agent_id), None)
+                tools = agent.tools if agent else []
+                task_id = f"task_{idx}"
+                task = {
+                    "id": task_id,
+                    "description": f"{pattern.description}\nUser goal: {user_goal}\nFocus: {agent_id}",
+                    "assigned_agent": agent_id,
+                    "tools": tools,
+                    "dependencies": [] if not prev_task_id or pattern.pattern_type == PatternType.PARALLEL else [prev_task_id]
+                }
+                tasks.append(task)
+                prev_task_id = task_id
+
+            return tasks
+        except Exception:
+            return []
+
+    def _apply_pattern_to_tasks(self, tasks: List[Dict], pattern_name: str) -> List[Dict]:
+        """Reorder tasks to match pattern agent sequence and align dependencies."""
+        try:
+            from ai_autonom.patterns.cai_patterns import PatternLibrary, PatternType
+            pattern = PatternLibrary.get_pattern(pattern_name)
+            if not pattern or not tasks:
+                return tasks
+
+            seq = pattern.agents or pattern.sequence or []
+            if not seq:
+                return tasks
+
+            ordered: List[Dict] = []
+            remaining = tasks[:]
+
+            for agent_id in seq:
+                for t in list(remaining):
+                    if t.get("assigned_agent") == agent_id:
+                        ordered.append(t)
+                        remaining.remove(t)
+
+            ordered.extend(remaining)
+
+            # Enforce dependencies for chain-like patterns
+            if pattern.pattern_type in (PatternType.SEQUENTIAL, PatternType.CHAIN, PatternType.HIERARCHICAL):
+                prev = None
+                for t in ordered:
+                    if prev and not t.get("dependencies"):
+                        t["dependencies"] = [prev]
+                    prev = t.get("id")
+            elif pattern.pattern_type == PatternType.PARALLEL:
+                for t in ordered:
+                    t["dependencies"] = []
+
+            return ordered
+        except Exception:
+            return tasks
     
     def _add_synthesis_if_needed(self, tasks: List[Dict], user_goal: str) -> List[Dict]:
         """Add final synthesis task if needed"""
@@ -566,9 +1404,8 @@ Requirements:
         """
         Orchestrator Logic: Evaluate if an agent should be granted a requested tool.
         """
-        if self.dashboard:
-            self.dashboard.set_orchestrator_status("Evaluating Tool Request")
-            self.dashboard.log(f"Agent requested: {request}")
+        if self.ui:
+            self.ui.log(f"Orchestrator evaluating tool request: {request}", "AGENT")
             
         # Get all available tools
         all_tools = self.tool_executor.get_available_tools()
@@ -613,6 +1450,9 @@ Return JSON ONLY:
 
     def execute_single_task(self, task: Dict, context: Dict = None) -> Dict:
         """Execute a single task with the assigned agent - ACTUALLY EXECUTE TOOLS!"""
+        if self._cancelled():
+            return {"success": False, "error": "Cancelled"}
+
         task_id = task.get('id', 'unknown')
         context = context or {}
         
@@ -626,35 +1466,66 @@ Return JSON ONLY:
             task.get('assigned_agent', ''),
             task.get('dependencies', [])
         )
-        self.task_memory.start_task(task_id)
-        
         # Get dependency context
         dep_context = self.task_memory.get_dependency_context(task_id)
+        ipc_dep_context = self._get_ipc_dependency_context(task.get('dependencies', []))
+
+        # Record input context in DB for downstream agents
+        self.task_memory.start_task(task_id, input_context={
+            "dependencies": dep_context,
+            "ipc_dependencies": ipc_dep_context,
+            "explicit_context": context or {}
+        })
         
         # Look up agent
         agents = self.registry.get_all_agents()
-        agent = next((a for a in agents if a.id == task.get('assigned_agent')), None)
+        agent_id = task.get('assigned_agent')
+        agent = next((a for a in agents if a.id == agent_id), None)
+        if not agent and agent_id:
+            alias_map = {
+                "web_pentester": "web_pentester_agent",
+                "report_agent": "reporting_agent",
+                "retester": "retester_agent",
+                "red_team": "red_team_agent"
+            }
+            mapped = alias_map.get(agent_id)
+            if mapped:
+                agent = next((a for a in agents if a.id == mapped), None)
+                if agent:
+                    task["assigned_agent"] = mapped
         
         if not agent:
             error = f"Agent not found: {task.get('assigned_agent')}"
             self.task_memory.fail_task(task_id, error)
             self.monitor.log_task_complete(task_id, False, error=error)
             return {"success": False, "error": error}
+
+        model_to_use = self._select_model_for_task(task, agent)
+        if model_to_use != agent.model_name and self.ui:
+            self.ui.log(
+                f"Model override for {task_id}: {agent.model_name} -> {model_to_use}",
+                "INFO",
+            )
             
-        if self.dashboard:
-            self.dashboard.set_active_agent(agent.name, "Initializing")
-            self.dashboard.log(f"Starting task: {task_id}")
+        if self.ui:
+            self.ui.set_active_agent(agent.name)
+            self.ui.update_task_status(task_id, "running")
+            self.ui.log(f"Starting task: {task_id}", "INFO")
+            self.ui.set_active_model(model_to_use)
+            self.ui.trace_event(
+                "task_start",
+                {
+                    "task_id": task_id,
+                    "agent": agent.name,
+                    "model": model_to_use,
+                },
+            )
         
         print(f"\n{'─'*70}")
         print(f"EXECUTING: {task_id}")
-        print(f"Agent: {agent.name} ({agent.model_name})")
+        print(f"Agent: {agent.name} ({model_to_use})")
         print(f"Tools: {', '.join(task.get('tools', []))}")
         print(f"{'─'*70}\n")
-        
-        # === LIVE MONITOR: Show task start ===
-        if LIVE_MONITOR_AVAILABLE:
-            monitor = get_live_monitor()
-            monitor.show_task_start(task_id, agent.name, task.get('description', ''))
         
         # Build task description with context
         context_str = ""
@@ -664,27 +1535,103 @@ Return JSON ONLY:
             context_str += "\n\nContext from previous tasks:\n"
             for dep_id, dep_info in dep_context["previous_outputs"].items():
                 context_str += f"\n--- {dep_id} ---\n{dep_info.get('output', '')[:1000]}\n"
+
+        # 1b. IPC Dependency Context (DB shared outputs)
+        if ipc_dep_context:
+            context_str += "\n\nContext from DB (IPC shared outputs):\n"
+            for dep_id, dep_info in ipc_dep_context.items():
+                context_str += f"\n--- {dep_id} ---\n{dep_info.get('output', '')[:1000]}\n"
+
+        # 1c. Explicit context passed from prior step
+        if context:
+            context_str += "\n\nContext from prior step:\n"
+            for k, v in context.items():
+                context_str += f"- {k}: {str(v)[:1000]}\n"
         
         # 2. Knowledge Base Context (The Blackboard)
         kb_summary = self.knowledge_base.get_summary()
         context_str += f"\n\n{kb_summary}"
+
+        # 2b. Vector Memory Context (Long-term)
+        try:
+            memory_hint = self.vector_store.query_natural(task.get('description', ''))
+            if memory_hint and "No relevant information" not in memory_hint:
+                context_str += f"\n\n[VECTOR MEMORY]\n{memory_hint[:1500]}"
+        except Exception:
+            pass
         
         # 3. Session Context
-        session_path = self.session_manager.current_session_dir
-        context_str += f"""
-        
-[SESSION WORKSPACE]
-You are working in a persistent session.
-- Source Code: {session_path}/src/
-- Binaries/EXEs: {session_path}/bin/
-- Docs: {session_path}/docs/
+        container_workspace = self.session_workspace or "outputs"
 
-IMPORTANT: When creating files, ALWAYS use these paths.
-Example: 'filesystem_write' path='{session_path}/src/main.cpp'
+        context_str += f"""
+
+[SESSION WORKSPACE]
+You are operating in a lightweight sandboxed workspace.
+- Workspace Root: {container_workspace}
+- Use relative paths like "src/main.py" or "docs/final_report.md".
+- Source code -> src/ | Binaries -> bin/ | Report -> docs/ | Notes -> memory/
+- If a tool runs inside a container, the host workspace is under /outputs/.
+- If you need a system binary (g++, nmap, etc.) and it is missing, follow the IMPOSSIBLE_TASK protocol.
+
+IMPORTANT WORKFLOW:
+1. **Plan**: Decide which tools you need (python_exec, bash_exec, filesystem_*).
+2. **Create**: Write files under src/ (or bin/docs/memory as appropriate) using 'filesystem_write'.
+3. **Execute**: Run them using 'bash_exec' or 'python_exec'.
 """
         
         task_description = task.get('description', '') + context_str
         
+        # Initialize full log if not exists
+        full_log_path = Path(self.session_manager.current_session_dir) / "full_orchestration_log.txt"
+        if not full_log_path.exists():
+            with open(full_log_path, 'w', encoding='utf-8') as f:
+                f.write(f"=== ORCHESTRATION LOG ===\nStarted: {datetime.now().isoformat()}\nGoal: {task.get('description', '')}\n\n")
+            print(f"\n[LOGGING] Full orchestration log available at: {full_log_path}\n")
+
+        try:
+            task_brief = {
+                "task_id": task_id,
+                "assigned_agent": agent.id,
+                "model": model_to_use,
+                "tools": task.get("tools", []),
+                "max_tool_iterations": max_iterations,
+            }
+            with open(full_log_path, "a", encoding="utf-8") as f:
+                f.write(f"[TASK BRIEF]: {json.dumps(task_brief, ensure_ascii=True)}\n")
+        except Exception:
+            pass
+
+        if agent.id in {"openmanus_coder", "openmanus_researcher"}:
+            if self._cancelled():
+                return self._cancel_result()
+            if self.ui:
+                self.ui.log(f"Running OpenManus ToolCall agent: {agent.name}", "INFO")
+            try:
+                next_step_prompt = None
+                if agent.id == "openmanus_coder":
+                    try:
+                        from app.prompt.swe import NEXT_STEP_PROMPT
+                        next_step_prompt = NEXT_STEP_PROMPT
+                    except Exception:
+                        pass
+                elif agent.id == "openmanus_researcher":
+                    try:
+                        from app.prompt.manus import NEXT_STEP_PROMPT
+                        next_step_prompt = NEXT_STEP_PROMPT
+                    except Exception:
+                        pass
+
+                output = run_toolcall_task(
+                    goal=task_description,
+                    system_prompt=agent.system_prompt or f"You are {agent.name}.",
+                    next_step_prompt=next_step_prompt,
+                    max_steps=max(1, int(self.config.get("execution.max_tool_iterations", 3))),
+                    cancel_event=self.cancel_event,
+                )
+                return {"success": True, "output": output}
+            except Exception as e:
+                return {"success": False, "error": f"OpenManus execution failed: {e}"}
+
         start = time.time()
         try:
             # === KEY CHANGE: TOOL-CALLING LOOP ===
@@ -701,23 +1648,45 @@ Example: 'filesystem_write' path='{session_path}/src/main.cpp'
                 base_prompt = f"You are {agent.name}."
             
             # Enhanced system message with capability checking and honest failure protocol
-            task_description = task.get('description', '')
+            capability_task_description = task.get('description', '')
             
             # Check capabilities BEFORE execution
             capability_warning = ""
             if CAPABILITY_CHECKER_AVAILABLE:
                 checker = CapabilityChecker()
-                cap_check = checker.validate(task_description)
+                cap_check = checker.validate(capability_task_description)
                 if not cap_check.can_complete:
                     capability_warning = cap_check.to_prompt_message()
                     print(f"[CAPABILITY] Task may be impossible: {cap_check.explanation}")
+
+            max_iterations = int(task.get("max_iterations") or self.config.get("execution.max_tool_iterations", 3))
+            max_iterations = max(1, max_iterations)
             
             # Construct full system message with enhanced rules
             system_message = f"""{base_prompt}
 
-Available tools: {', '.join(task.get('tools', []))}
+  Available tools: {', '.join(task.get('tools', []))}
+  Only use tools listed above. Do NOT use cai_* tools unless explicitly listed.
+  You have at most {max_iterations} tool iterations for this task.
+  Prefer a single response with multiple TOOL blocks if you need more than one tool.
 
 You MUST use tools to complete this task. Don't just describe what to do - ACTUALLY DO IT!
+
+*** GLOBAL MANDATE: AUTONOMY & SELF-CORRECTION ***
+You are an autonomous agent operating in a real environment.
+We expect you to encounter errors. This is normal.
+
+WHEN A TOOL FAILS:
+1. DO NOT STOP.
+2. READ the error message carefully.
+3. SELF-CORRECT: Modify your command parameters based on the error.
+   - "Is a directory" -> You forgot the filename.
+   - "Host unreachable" -> Try a different flag or check network.
+   - "Permission denied" -> Verify you are in the session workspace.
+4. RETRY immediately.
+
+You have permission to "fail forward". Iterate until you succeed or exhaust all options.
+Only ask for human help if you are completely blocked after 3 distinct attempts.
 
 *** CRITICAL: HONEST FAILURE PROTOCOL ***
 
@@ -751,21 +1720,41 @@ Before attempting ANY task, you MUST verify capability:
 
 *** TOOL USAGE ***
 
-To use a tool:
-    TOOL: tool_name
-    target: value
-    args: value
+To use a tool, you MUST provide your reasoning first.
+REQUIRED FORMAT:
+
+THOUGHT:
+[Explain your reasoning: why you are choosing this tool, what you expect to happen]
+
+TOOL: tool_name
+target: value
+args: value
+
+Alternate JSON format (also accepted):
+
+THOUGHT:
+[Explain reasoning]
+
+ACTION: tool_name
+ACTION INPUT: {{"param": "value"}}
+
+Chaining tool outputs:
+- Use $LAST_OUTPUT or $LAST_OUTPUT_1K in tool params to inject the previous tool's output.
 
 Or for Linux commands:
-    TOOL: cai_generic_linux_command
-    command: your command here
+    
+THOUGHT:
+I need to check if the file exists before writing to it.
+
+  TOOL: bash_exec
+command: ls -la .
 
 *** PRE-FLIGHT EXAMPLE ***
 
 User asks: "Create a Windows .exe from my Python script"
 
 CORRECT BEHAVIOR:
-    TOOL: cai_generic_linux_command
+    TOOL: bash_exec
     command: which x86_64-w64-mingw32-gcc && which pyinstaller
     
     [Output: nothing found]
@@ -792,7 +1781,8 @@ ASK_USER: <question> - Ask user for decision or clarification
 3. If a command fails, READ THE ERROR and fix parameters
 4. Focus on the ACTUAL target provided by user
 5. NEVER say COMPLETE unless task was actually accomplished
-6. You have FULL FREEDOM to execute commands in Kali container"""
+6. Cite memory when used: mention [VECTOR MEMORY] or [KB] in your THOUGHT
+7. You have FULL FREEDOM to execute commands within the available sandbox tools"""
 
             conversation_history = [
                 LLMMessage(
@@ -804,37 +1794,109 @@ ASK_USER: <question> - Ask user for decision or clarification
             
             provider = self.get_provider_for_agent(agent)
             full_response = ""
-            max_iterations = 10
             iteration = 0
+            completed = False
             
             while iteration < max_iterations:
                 iteration += 1
                 
-                # === LIVE MONITOR: Show iteration ===
-                if LIVE_MONITOR_AVAILABLE:
-                    monitor = get_live_monitor()
-                    monitor.show_iteration_header(iteration, max_iterations)
-                else:
-                    print(f"\n[Iteration {iteration}]")
+                print(f"\n[Iteration {iteration}]")
                 
                 # Get agent response
-                response = provider.chat(conversation_history, agent.model_name)
+                response = provider.chat(conversation_history, model_to_use)
                 agent_msg = response.content
+
                 full_response += f"\n\n=== Iteration {iteration} ===\n{agent_msg}"
+
+                # Enforce ReAct schema: require THOUGHT and TOOL/ACTION blocks
+                has_thought = "THOUGHT:" in agent_msg
+                has_tool = "TOOL:" in agent_msg or "ACTION:" in agent_msg
+                if "COMPLETE:" not in agent_msg and (not has_thought or not has_tool):
+                    format_hint = """FORMAT ERROR: Use the ReAct schema every turn.
+THOUGHT:
+[your reasoning]
+
+TOOL: tool_name
+param: value
+
+Or:
+ACTION: tool_name
+ACTION INPUT: {"param": "value"}
+
+If done, reply with COMPLETE: <summary>."""
+                    conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
+                    conversation_history.append(LLMMessage(role="user", content=format_hint))
+                    print("[FORMAT] Missing THOUGHT/TOOL - prompting agent to follow ReAct\n")
+                    continue
                 
+                # === EXTRACT THINKING ===
+                # "Thinking" is generally everything before the first tool call
+                thinking_content = agent_msg
+                if "THOUGHT:" in agent_msg:
+                    # Extract content between THOUGHT: and TOOL:
+                    parts = agent_msg.split("THOUGHT:", 1)[1]
+                    if "TOOL:" in parts:
+                        thinking_content = parts.split("TOOL:")[0].strip()
+                    elif "ACTION:" in parts:
+                        thinking_content = parts.split("ACTION:")[0].strip()
+                    elif "COMPLETE:" in parts:
+                        thinking_content = parts.split("COMPLETE:")[0].strip()
+                    else:
+                        thinking_content = parts.strip()
+                elif "TOOL:" in agent_msg:
+                    thinking_content = agent_msg.split("TOOL:")[0].strip()
+                elif "ACTION:" in agent_msg:
+                    thinking_content = agent_msg.split("ACTION:")[0].strip()
+                elif "COMPLETE:" in agent_msg:
+                    thinking_content = agent_msg.split("COMPLETE:")[0].strip()
+                
+                # Check if it was empty but perhaps malformed (Fallback for blind spots)
+                thinking_content = thinking_content.strip()
+                if not thinking_content and len(agent_msg) > 10 and ("TOOL:" in agent_msg or "ACTION:" in agent_msg):
+                    # If we found nothing but there IS a TOOL call, maybe standard text before it is the thought
+                    marker = "TOOL:" if "TOOL:" in agent_msg else "ACTION:"
+                    thinking_content = agent_msg.split(marker)[0].strip()
+
+                if thinking_content:
+                    print(f"\n[AGENT THOUGHT] {agent.name}:\n{thinking_content.strip()}\n")
+                    
+                    # Append to full log
+                    with open(full_log_path, 'a', encoding='utf-8') as f:
+                        f.write(f"\n--- Iteration {iteration} ---\n")
+                        f.write(f"[{agent.name} THINKING]:\n{thinking_content.strip()}\n")
+
+                    # Capture decisions/assumptions for memory
+                    for raw_line in thinking_content.splitlines():
+                        line = raw_line.strip()
+                        lower = line.lower()
+                        if lower.startswith("decision:") or lower.startswith("assumption:") or lower.startswith("constraint:"):
+                            decision_text = line.split(":", 1)[1].strip()
+                            if decision_text:
+                                try:
+                                    self.task_memory.add_decision(
+                                        task_id,
+                                        decision_text,
+                                        "from agent thought",
+                                        agent.id
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    self.vector_store.store_decision(
+                                        task_id=task_id,
+                                        decision=decision_text,
+                                        rationale="from agent thought"
+                                    )
+                                except Exception:
+                                    pass
+                else:
+                    print(f"\n[AGENT THOUGHT] {agent.name}: (No thought provided)\n")
+
                 # DEBUG LOG
                 log_debug(f"AGENT_{agent.name}", agent_msg, "THOUGHT")
                 
-                if self.dashboard:
-                    self.dashboard.set_active_agent(agent.name, "Thinking")
-                    self.dashboard.update_agent_thought(agent_msg)
-                
-                # === LIVE MONITOR: Show agent thinking ===
-                if LIVE_MONITOR_AVAILABLE:
-                    monitor = get_live_monitor()
-                    monitor.show_agent_response(agent.name, agent_msg, truncate=300)
-                else:
-                    print(f"Agent: {agent_msg[:500]}...\n")
+                if self.ui:
+                    self.ui.log(f"{agent.name} thinking...", "AGENT")
                 
                 # Check if agent wants to use a tool or request one
                 if "REQUEST_TOOL:" in agent_msg:
@@ -844,11 +1906,10 @@ ASK_USER: <question> - Ask user for decision or clarification
                     
                     requested_tool = req_match.group(1).strip() if req_match else "unknown"
                     
-                    if LIVE_MONITOR_AVAILABLE:
-                        monitor = get_live_monitor()
-                        monitor.show_warning(f"Agent requesting new tool: {requested_tool}")
-                    else:
-                        print(f"\n[ORCHESTRATOR] Agent requesting tool: {requested_tool}")
+                    if self.ui:
+                        self.ui.log(f"Agent requesting tool: {requested_tool}", "TOOL")
+                    
+                    print(f"\n[ORCHESTRATOR] Agent requesting tool: {requested_tool}")
                     
                     # Evaluate request
                     decision = self._evaluate_tool_request(
@@ -892,6 +1953,9 @@ Please proceed using your currently available tools."""
                     conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
                     conversation_history.append(LLMMessage(role="user", content=feedback))
                     print(f"[ORCHESTRATOR] Decision: {'Approved' if decision.get('approved') else 'Denied'}")
+                    
+                    with open(full_log_path, 'a', encoding='utf-8') as f:
+                        f.write(f"[TOOL REQUEST]: {requested_tool} -> {decision.get('approved')}\n")
 
                 elif "REQUEST_HANDOFF:" in agent_msg:
                     import re
@@ -904,10 +1968,17 @@ Please proceed using your currently available tools."""
                     print(f"\n[ORCHESTRATOR] Agent requesting handoff to: {target_agent}")
                     
                     # Evaluate handoff
+                    handoff_dependency_context = {
+                        "previous_outputs": dep_context.get("previous_outputs", {}),
+                        "code_artifacts": dep_context.get("code_artifacts", []),
+                        "decisions": dep_context.get("decisions", []),
+                        "explicit_context": context or {}
+                    }
                     handoff_decision = self.handoff_manager.evaluate_handoff_request(
                         agent.name,
                         target_agent,
-                        handoff_context
+                        handoff_context,
+                        dependency_context=handoff_dependency_context
                     )
                     
                     if handoff_decision.get("approved"):
@@ -942,15 +2013,17 @@ Please continue the task yourself."""
                         
                     conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
                     conversation_history.append(LLMMessage(role="user", content=feedback))
+                    
+                    with open(full_log_path, 'a', encoding='utf-8') as f:
+                        f.write(f"[HANDOFF REQUEST]: {target_agent} -> {handoff_decision.get('approved')}\n")
 
                 elif "ASK_USER:" in agent_msg:
                     import re
                     question_match = re.search(r'ASK_USER:\s*(.+)', agent_msg, re.DOTALL)
                     question = question_match.group(1).strip() if question_match else "User attention required."
                     
-                    if self.dashboard:
-                        self.dashboard.log(f"Agent asking: {question[:50]}...")
-                        self.dashboard.set_active_agent(agent.name, "Waiting for User")
+                    if self.ui:
+                        self.ui.log(f"Agent asking: {question[:50]}...", "AGENT")
                     
                     # Pause and get input
                     # We need a way to get input from the TUI/REPL context.
@@ -969,138 +2042,319 @@ Please continue the task yourself."""
                     conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
                     conversation_history.append(LLMMessage(role="user", content=feedback))
                     
-                    if self.dashboard:
-                        self.dashboard.log("User responded.")
+                    if self.ui:
+                        self.ui.log("User responded.", "INFO")
+                    
+                    with open(full_log_path, 'a', encoding='utf-8') as f:
+                        f.write(f"[USER ASK]: {question}\n[RESPONSE]: {user_response}\n")
 
-                elif "TOOL:" in agent_msg or "COMPLETE:" in agent_msg:
-                    # Parse tool call - simple line-based format
-                    if "TOOL:" in agent_msg:
+
+                elif "TOOL:" in agent_msg or "ACTION:" in agent_msg:
+                    # Parse tool call - supports MULTIPLE SEQUENTIAL TOOLS
+                    tools_getting_executed = []
+                    if "ACTION:" in agent_msg and "ACTION INPUT:" in agent_msg:
+                        import re
+
+                        action_match = re.search(r"ACTION:\s*(.+)", agent_msg)
+                        raw_input = agent_msg.split("ACTION INPUT:", 1)[1]
+                        # Trim trailing content after a new tool/action block
+                        for marker in ["\nTOOL:", "\nACTION:"]:
+                            if marker in raw_input:
+                                raw_input = raw_input.split(marker, 1)[0]
+                        raw_input = raw_input.strip()
+                        if raw_input.startswith("```"):
+                            raw_input = raw_input.split("\n", 1)[1] if "\n" in raw_input else ""
+                            if "```" in raw_input:
+                                raw_input = raw_input.rsplit("```", 1)[0]
+                            raw_input = raw_input.strip()
+
+                        try:
+                            action_name = action_match.group(1).strip() if action_match else ""
+                            params = json.loads(raw_input) if raw_input else {}
+                            if action_name:
+                                tools_getting_executed.append({"name": action_name, "params": params})
+                        except Exception as e:
+                            error_feedback = f"""❌ ACTION FAILED!
+
+OBSERVATION:
+Invalid ACTION INPUT JSON: {e}
+
+INSTRUCTIONS:
+- Provide valid JSON after ACTION INPUT.
+- Example: ACTION INPUT: {{"query": "example"}}
+"""
+                            conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
+                            conversation_history.append(LLMMessage(role="user", content=error_feedback))
+                            print("[FORMAT] Invalid ACTION INPUT JSON - prompting retry\n")
+                            continue
+
+                    elif "TOOL:" in agent_msg:
                         import re
                         
-                        # Extract FIRST tool name only (agents sometimes try to call multiple)
-                        tool_matches = re.findall(r'TOOL:\s*([\w_]+)', agent_msg)
-                        if not tool_matches:
-                            print("[ERROR] Malformed tool call\n")
-                            break
+                        # Split message into lines to robustly parse multiple tools
+                        lines = agent_msg.split('\n')
+                        tools_getting_executed = []
                         
-                        tool_name = tool_matches[0]  # Take only the FIRST tool
+                        current_tool = None
+                        current_params = {}
+                        last_param_key = None
                         
-                        if len(tool_matches) > 1:
-                            print(f"[WARNING] Agent tried to call multiple tools at once: {tool_matches}")
-                            print(f"[WARNING] Executing only first tool: {tool_name}\n")
+                        for line in lines:
+                            stripped_line = line.strip()
+                            # Do NOT strip empty lines if capturing multiline content
+                            
+                            if stripped_line.startswith("TOOL:"):
+                                # If we were parsing a tool, save it
+                                if current_tool:
+                                    tools_getting_executed.append({"name": current_tool, "params": current_params})
+                                
+                                # Start new tool
+                                parts = stripped_line.split(":", 1)
+                                if len(parts) > 1:
+                                    current_tool = parts[1].strip()
+                                    current_params = {}
+                                    last_param_key = None
+                            
+                            elif current_tool:
+                                # Check if this line is a new parameter key
+                                # Heuristic: keys are usually single words or snake_case, no spaces, followed by colon
+                                is_new_param = False
+                                
+                                if ":" in stripped_line:
+                                    potential_key, potential_val = stripped_line.split(":", 1)
+                                    potential_key = potential_key.strip()
+                                    
+                                    # Valid param key validation
+                                    # 1. No spaces in key (e.g. "for i in range" -> has spaces, NOT a key)
+                                    # 2. Not a python keyword (basic heuristic)
+                                    # 3. Not a path or url (http://...)
+                                    if (len(potential_key.split()) == 1 and 
+                                        potential_key not in ["def", "class", "if", "for", "while", "http", "https"] and
+                                        not potential_key.startswith("/")):
+                                        
+                                        val = potential_val.strip()
+                                        # Remove YAML block scalars if they are the only content
+                                        if val in ["|", ">"]:
+                                            val = ""
+                                        current_params[potential_key] = val
+                                        last_param_key = potential_key
+                                        is_new_param = True
+                                
+                                if not is_new_param:
+                                    if last_param_key:
+                                        # It's continuation of the previous parameter value (e.g. valid python code with colons)
+                                        # Use original 'line' to preserve indentation
+                                        current_params[last_param_key] += "\n" + line
+                                    else:
+                                        # Content before any param? Ignore or log.
+                                        pass
                         
-                        # Parse parameters from lines like "key: value"
-                        # Only parse params for the FIRST tool
-                        params = {}
-                        in_first_tool = False
-                        for line in agent_msg.split('\n'):
-                            # Start parsing when we hit the first TOOL:
-                            if line.strip().startswith('TOOL:') and tool_name in line:
-                                in_first_tool = True
-                                continue
-                            # Stop if we hit another TOOL:
-                            if line.strip().startswith('TOOL:') and tool_name not in line:
-                                break
-                            # Parse parameter lines
-                            if in_first_tool and ':' in line:
-                                parts = line.split(':', 1)
-                                if len(parts) == 2:
-                                    key = parts[0].strip()
-                                    value = parts[1].strip()
-                                    if key and value and not key.startswith('TOOL'):
-                                        params[key] = value
+                        # Append the last tool
+                        if current_tool:
+                            tools_getting_executed.append({"name": current_tool, "params": current_params})
                         
-                        print(f"[TOOL] Executing: {tool_name}")
+                        if not tools_getting_executed:
+                             print("[ERROR] Malformed tool call")
+                    else:
+                        error_feedback = """❌ ACTION FAILED!
+
+OBSERVATION:
+ACTION block missing ACTION INPUT JSON.
+
+INSTRUCTIONS:
+- Use ACTION INPUT with valid JSON.
+- Example: ACTION INPUT: {"query": "example"}
+"""
+                        conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
+                        conversation_history.append(LLMMessage(role="user", content=error_feedback))
+                        print("[FORMAT] ACTION missing ACTION INPUT - prompting retry\n")
+                        continue
+
+                    if not tools_getting_executed:
+                        error_feedback = """❌ ACTION FAILED!
+
+OBSERVATION:
+No tool parsed from the response.
+
+INSTRUCTIONS:
+- Provide TOOL or ACTION with valid parameters.
+"""
+                        conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
+                        conversation_history.append(LLMMessage(role="user", content=error_feedback))
+                        print("[FORMAT] Empty tool list - prompting retry\n")
+                        continue
+
+                    # Execute sequential tools
+                    execution_log = ""
+                    overall_success = True
+                    last_tool_output = ""
+
+                    def _apply_output_placeholders(value, last_output):
+                        if not last_output:
+                            return value
+                        if isinstance(value, str):
+                            return value.replace("$LAST_OUTPUT", last_output[:4000]).replace("$LAST_OUTPUT_1K", last_output[:1000])
+                        if isinstance(value, list):
+                            return [_apply_output_placeholders(v, last_output) for v in value]
+                        if isinstance(value, dict):
+                            return {k: _apply_output_placeholders(v, last_output) for k, v in value.items()}
+                        return value
+
+                    for i, tool_call in enumerate(tools_getting_executed):
+                        tool_name = tool_call["name"]
+                        params = _apply_output_placeholders(tool_call["params"], last_tool_output)
+                        
+                        print(f"[TOOL {i+1}/{len(tools_getting_executed)}] Executing: {tool_name}")
                         print(f"[PARAMS] {params}\n")
                         
-                        if self.dashboard:
-                            self.dashboard.set_active_tool(f"{tool_name} {params.get('target', '')}")
-                            self.dashboard.log(f"Agent executing {tool_name}")
+                        if self.ui:
+                            self.ui.set_active_tool(f"{tool_name}")
+                            self.ui.log(f"Executing {tool_name} ({i+1})", "TOOL")
+                            self.ui.trace_event(
+                                "tool_start",
+                                {
+                                    "task_id": task_id,
+                                    "tool": tool_name,
+                                    "index": i + 1,
+                                    "total": len(tools_getting_executed),
+                                },
+                            )
                         
-                        # === LIVE MONITOR: Show tool selection ===
-                        if LIVE_MONITOR_AVAILABLE:
-                            monitor = get_live_monitor()
-                            monitor.show_tool_selection(agent.name, tool_name, params)
-                        
-                        # === ACTUALLY EXECUTE THE TOOL ===
+                        # === EXECUTE ===
+                        tool_started = time.time()
                         success, tool_output = self.tool_executor.execute(
                             tool_name,
                             params,
                             agent_id=agent.id,
                             task_id=task_id
                         )
+                        last_tool_output = tool_output
+                        tool_elapsed = time.time() - tool_started
                         
-                        # DEBUG LOG
+                        execution_log += f"\n=== TOOL {i+1}: {tool_name} ===\nStatus: {'SUCCESS' if success else 'FAILED'}\nOutput:\n{tool_output}\n"
+                        
+                        # Log individual tool result
+                        with open(full_log_path, 'a', encoding='utf-8') as f:
+                            f.write(f"[TOOL EXECUTION]: {tool_name}\nParams: {params}\nResult: {tool_output}\n")
+                        
+                        # Log to Debug
                         log_debug(f"TOOL_{tool_name}", {"params": params, "output": tool_output, "success": success}, "EXECUTION")
-                        
-                        if self.dashboard:
-                            self.dashboard.set_active_tool(None)
-                            status = "Success" if success else "Failed"
-                            # Log failure details to dashboard if failed
-                            if not success:
-                                error_preview = tool_output[:50].replace('\n', ' ')
-                                self.dashboard.log(f"Tool Failed: {error_preview}...")
-                            else:
-                                self.dashboard.log(f"Tool {tool_name}: {status}")
-                        
-                        print(f"[RESULT] {tool_output[:500]}...\n")
-                        
-                        # === RETRY LOGIC: Don't accept failure easily ===
+
+                        if self.ui:
+                            self.ui.trace_event(
+                                "tool_end",
+                                {
+                                    "task_id": task_id,
+                                    "tool": tool_name,
+                                    "index": i + 1,
+                                    "total": len(tools_getting_executed),
+                                    "status": "success" if success else "failed",
+                                    "duration_sec": round(tool_elapsed, 2),
+                                },
+                            )
+
+                        # Persist code artifacts to vector memory
+                        if success:
+                            try:
+                                code_content = None
+                                path_hint = None
+                                if tool_name in ["filesystem_write", "filesystem_append", "cai_filesystem_write"]:
+                                    code_content = params.get("content") or params.get("args")
+                                    path_hint = params.get("path") or params.get("file") or params.get("target")
+                                elif tool_name in ["python_exec", "cai_execute_code", "execute_code"]:
+                                    code_content = params.get("code") or params.get("content")
+                                    path_hint = params.get("filename") or params.get("target")
+
+                                if code_content:
+                                    self.vector_store.store_code(
+                                        task_id=task_id,
+                                        code=code_content,
+                                        metadata={"path": path_hint or "", "tool": tool_name}
+                                    )
+                            except Exception:
+                                pass
+
                         if not success:
-                            # Tool failed - force agent to retry with better parameters
-                            error_feedback = f"""❌ TOOL EXECUTION FAILED!
-
-Error: {tool_output}
-
-You MUST fix this and try again. Common fixes:
-- Check file paths exist (use 'ls' first to verify)
-- Fix command syntax (check 'man command' for correct usage)
-- Use correct parameter format
-- Verify network targets are reachable
-
-DO NOT say COMPLETE until the tool succeeds!
-Analyze the error, fix the parameters, and call the tool again."""
-                            
-                            conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
-                            conversation_history.append(LLMMessage(
-                                role="user",
-                                content=error_feedback
-                            ))
-                            
-                            if LIVE_MONITOR_AVAILABLE:
-                                monitor = get_live_monitor()
-                                monitor.show_warning(f"Tool '{tool_name}' failed - forcing retry")
-                            else:
-                                print(f"[WARNING] Tool failed - forcing agent to retry\n")
-                        else:
-                            # Tool succeeded - give output and continue
-                            success_feedback = f"""✅ Tool '{tool_name}' executed successfully!
-
-Output:
-{tool_output}
-
-Analyze the output. If you need more information:
-- Use another tool to gather additional data
-- Run the same tool with different parameters
-- When task is fully complete, say: COMPLETE: [your summary]
-
-Do not say COMPLETE if you still need to gather more information!"""
-                            
-                            conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
-                            conversation_history.append(LLMMessage(
-                                role="user",
-                                content=success_feedback
-                            ))
+                            overall_success = False
+                            # STP CHAIN ON FAILURE
+                            execution_log += "\n[CHAIN ABORTED DUE TO FAILURE]\n"
+                            break
+                        
+                    # === CONSOLIDATED FEEDBACK ===
+                    # We must provide exactly ONE robust feedback message to the agent.
                     
-                    elif "COMPLETE:" in agent_msg:
-                        # Agent wants to finish - check if they actually did anything useful
-                        
-                        # Count successful tool executions
-                        successful_tools = full_response.count("✅ Tool") + full_response.count("SUCCESS")
-                        
-                        if successful_tools < 1:
-                            # Agent trying to quit without doing any work!
-                            rejection = f"""🚫 REJECTED: You cannot say COMPLETE yet!
+                    if not overall_success:
+                         # Smart Error Analysis
+                         hint = "Check your parameters."
+                         if "No such file" in execution_log:
+                             hint = f"path does not exist. Did you create the file under the session workspace ({container_workspace})?"
+                         if "Is a directory" in execution_log:
+                             hint = "you targeted a directory but the tool expects a file path."
+                         if "Permission denied" in execution_log:
+                             hint = "you do not have permission. Try a different path."
+                         if "command not found" in execution_log.lower():
+                             hint = "Tool dependency missing. Use `execute_command` with 'apt-get install' or verify the binary name."
+                             
+                         error_feedback = f"""❌ ACTION FAILED!
+
+OBSERVATION:
+{execution_log}
+
+DEBUGGING CONTEXT:
+1. The tool execution failed.
+2. The specific error output is provided above.
+3. HINT: {hint}
+
+INSTRUCTIONS FOR RECOVERY (Attempt {iteration}/{max_iterations}):
+1. Analyze the error message in the output above.
+2. Adjust your parameters (checks paths, filenames, content).
+3. Try the tool again with corrected values.
+
+DO NOT say COMPLETE until you have fixed this error and successfully executed the task."""
+                         
+                         conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
+                         conversation_history.append(LLMMessage( role="user", content=error_feedback ))
+                         print(f"[WARNING] Tool chain failed - forcing retry\n")
+                         
+                    else:
+                         success_feedback = f"""✅ ACTION SUCCESSFUL!
+
+OBSERVATION:
+{execution_log}
+
+CONTEXTUAL AWARENESS:
+1. Tools executed successfully.
+2. If you wrote a code file, the next logical step is usually to EXECUTE it using run_script or execute_command.
+3. If you ran a script, check the output above. Does it satisfy the user's request?
+
+DECISION:
+- If the task is fully complete, respond with "COMPLETE: [summary]".
+- If more steps are needed (like running the script you just wrote), continue immediately with the next tool."""
+                         
+                         conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
+                         conversation_history.append(LLMMessage( role="user", content=success_feedback ))
+
+                    if self.ui:
+                        self.ui.set_active_tool(None)
+                        status = "Success" if overall_success else "Failed"
+                        level = "SUCCESS" if overall_success else "ERROR"
+                        self.ui.log(f"Tool Chain: {status}", level)
+                    
+                    print(f"[RESULT CHAIN] {execution_log[:200]}...\n")
+                
+                elif "COMPLETE:" in agent_msg:
+                    # Agent wants to finish - check if they actually did anything useful
+                    
+                    # Check conversation history for successful tool executions
+                    # We look for "ACTION SUCCESSFUL" in user messages which indicates a successful previous turn
+                    history_success = any("ACTION SUCCESSFUL" in msg.content for msg in conversation_history)
+                    
+                    # Or check current response
+                    current_success = "SUCCESS" in full_response or "passed" in full_response
+                    
+                    if not history_success and not current_success:
+                        # Agent trying to quit without doing any work!
+                        rejection = f"""🚫 REJECTED: You cannot say COMPLETE yet!
 
 You have not successfully executed ANY tools yet. You must:
 1. Actually USE the tools available to you
@@ -1109,29 +2363,29 @@ You have not successfully executed ANY tools yet. You must:
 4. THEN provide a summary
 
 Do NOT give up. Use the tools and try again!"""
-                            
-                            conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
-                            conversation_history.append(LLMMessage(
-                                role="user",
-                                content=rejection
-                            ))
-                            
-                            if LIVE_MONITOR_AVAILABLE:
-                                monitor = get_live_monitor()
-                                monitor.show_warning("Agent tried to complete task without gathering data - rejected")
-                            else:
-                                print("[WARNING] Agent tried to quit early - forcing retry\n")
-                        else:
-                            # Agent actually did work - allow completion
-                            print("[COMPLETE] Agent finished task\n")
-                            break
+                        
+                        conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
+                        conversation_history.append(LLMMessage(
+                            role="user",
+                            content=rejection
+                        ))
+                        
+                        print("[WARNING] Agent tried to quit early - forcing retry\n")
+                    else:
+                        # Agent actually did work - allow completion
+                        print("[COMPLETE] Agent finished task\n")
+                        completion_msg = agent_msg.split("COMPLETE:")[1].strip() if "COMPLETE:" in agent_msg else "Done."
+                        with open(full_log_path, 'a', encoding='utf-8') as f:
+                            f.write(f"[COMPLETED]: {completion_msg}\n")
+                        completed = True
+                        break
                 
                 else:
                     # Agent didn't use proper format - prompt them
                     conversation_history.append(LLMMessage(role="assistant", content=agent_msg))
                     conversation_history.append(LLMMessage(
                         role="user",
-                        content="Please use tools! Format:\nTOOL: tool_name\nparameter: value\n\nOr say COMPLETE: [summary] if done."
+                        content="Please use tools! Format:\nTOOL: tool_name\nparameter: value\n\nOr:\nACTION: tool_name\nACTION INPUT: {\"param\": \"value\"}\n\nOr say COMPLETE: [summary] if done."
                     ))
             
             elapsed = time.time() - start
@@ -1146,21 +2400,65 @@ Do NOT give up. Use the tools and try again!"""
                 f.write(f"Iterations: {iteration}\n")
                 f.write("="*70 + "\n\n")
                 f.write(full_response)
+
+            if not completed:
+                error = f"Max tool iterations ({max_iterations}) exceeded without completion."
+                self.task_memory.fail_task(task_id, error)
+                self.monitor.log_task_complete(task_id, False, error=error)
+                if self.ui:
+                    self.ui.update_task_status(task_id, "failed")
+                    self.ui.log(f"Task {task_id} failed: {error}", "ERROR")
+                    self.ui.trace_event(
+                        "task_failed",
+                        {"task_id": task_id, "reason": error},
+                    )
+                return {
+                    "success": False,
+                    "error": error,
+                    "output": full_response,
+                    "output_file": output_file,
+                    "execution_time": elapsed,
+                    "agent": agent.name
+                }
             
             # Update memory
             self.task_memory.complete_task(task_id, full_response, [])
             self.monitor.log_task_complete(task_id, True, tokens=len(full_response.split()))
+
+            # Store output in vector memory for long-term recall
+            try:
+                self.vector_store.store_conversation(
+                    task_id=task_id,
+                    agent_id=agent.id,
+                    content=full_response,
+                    role="assistant"
+                )
+            except Exception:
+                pass
+
+            # Publish output to IPC DB for downstream agents
+            self._publish_task_output(task_id, full_response, agent.name)
             
             # === VRAM OPTIMIZATION: Unload Agent ===
             # After task completion, unload the agent's model to free VRAM for the next agent
             if self.config.get('execution.vram_optimized', True):
                 if hasattr(provider, 'unload_model'):
-                    provider.unload_model(agent.model_name)
+                    if self.ui:
+                        self.ui.log(f"Unloading Agent Model ({model_to_use})...", "INFO")
+                    provider.unload_model(model_to_use)
             
-            # === LIVE MONITOR: Show task complete ===
-            if LIVE_MONITOR_AVAILABLE:
-                monitor = get_live_monitor()
-                monitor.show_task_complete(task_id, True, elapsed)
+            if self.ui:
+                self.ui.update_task_status(task_id, "completed")
+                self.ui.log(f"Task {task_id} complete", "SUCCESS")
+                self.ui.trace_event(
+                    "task_complete",
+                    {
+                        "task_id": task_id,
+                        "agent": agent.name,
+                        "model": model_to_use,
+                        "duration_sec": round(elapsed, 2),
+                    },
+                )
             
             print(f"Execution time: {elapsed:.2f}s")
             print(f"Saved to: {output_file}")
@@ -1179,15 +2477,19 @@ Do NOT give up. Use the tools and try again!"""
             self.monitor.log_task_complete(task_id, False, error=error)
             
             print(f"Error: {error}")
+            if self.ui:
+                self.ui.trace_event(
+                    "task_failed",
+                    {"task_id": task_id, "reason": error},
+                )
             
             return {"success": False, "error": error}
     
     def run(self, user_goal: str) -> Dict[str, Any]:
         """Complete orchestration workflow"""
-        if self.dashboard:
-            self.dashboard.update_goal(user_goal)
-            if not self.dashboard.running:
-                self.dashboard_thread.start()
+        if self.ui:
+            self.ui.start(user_goal)
+            self.ui.log("Orchestrator started", "INFO")
         
         print(f"\n{'#'*70}")
         print("NEMOTRON ORCHESTRATOR")
@@ -1197,53 +2499,197 @@ Do NOT give up. Use the tools and try again!"""
         total_start = time.time()
         
         # Initialize Session (Create Folders)
-        session_path = self.session_manager.create_session(user_goal)
+        if not self.session_manager.current_session_dir:
+            session_path = self.start_session(user_goal)
+        else:
+            session_path = self.session_manager.current_session_dir
+            self._configure_session_workspace(session_path)
+            if self.ui:
+                try:
+                    self.ui.set_session(
+                        self.session_manager.current_session_id,
+                        self.session_manager.current_session_dir,
+                    )
+                except Exception:
+                    pass
         print(f"[SESSION] Active Workspace: {session_path}")
         
         # Start workflow
         self.current_workflow_id = self.task_memory.start_workflow()
-        
-        if self.dashboard:
-            self.dashboard.set_orchestrator_status("Analyzing Intent")
+
+        if self.ui:
+            self.ui.log("Analyzing Intent...", "INFO")
+
+        if self._cancelled():
+            return self._cancel_result()
             
         # Phase 1: Intent Analysis
         intent_result = self.analyze_intent(user_goal)
         enhancement = intent_result.get("enhancement", "")
+        analysis = intent_result.get("analysis")
+        pattern_name = analysis.suggested_pattern if analysis else None
+        if self.ui:
+            try:
+                self.ui.trace_event(
+                    "intent_analysis",
+                    {
+                        "task_type": getattr(analysis.task_type, "value", None) if analysis else None,
+                        "complexity": getattr(analysis.complexity, "value", None) if analysis else None,
+                        "confidence": getattr(analysis, "confidence", None) if analysis else None,
+                    },
+                )
+            except Exception:
+                pass
+
+        try:
+            analysis_payload = {
+                "analysis": analysis.to_dict() if hasattr(analysis, "to_dict") else {},
+                "enhancement": enhancement,
+                "created_at": datetime.now().isoformat(),
+            }
+            self._write_memory_json("intent_analysis.json", analysis_payload, versioned=True)
+            if self.ui:
+                self.ui.set_intent_analysis(analysis_payload)
+        except Exception:
+            pass
         
-        if self.dashboard:
-            self.dashboard.set_orchestrator_status("Decomposing Task")
+        if self.ui:
+            self.ui.log("Decomposing Task...", "INFO")
+
+        if self._cancelled():
+            return self._cancel_result()
             
         # Phase 2: Decomposition
-        tasks = self.decompose_and_assign(user_goal, enhancement)
+        tasks = self.decompose_and_assign(user_goal, enhancement, pattern_name=pattern_name)
+
+        # Ensure outputs flow to the next task by default
+        self._ensure_sequential_dependencies(tasks)
+        if self.ui:
+            try:
+                self.ui.trace_event(
+                    "plan_ready",
+                    {"task_count": len(tasks), "pattern": pattern_name},
+                )
+            except Exception:
+                pass
+
+        try:
+            briefs_payload = {
+                "created_at": datetime.now().isoformat(),
+                "tasks": self._build_task_briefs(tasks),
+            }
+            self._write_memory_json("task_briefs.json", briefs_payload, versioned=True)
+            if self.ui:
+                self.ui.set_task_briefs(briefs_payload)
+        except Exception:
+            pass
+
+        # Store current plan and persist to DB/IPC
+        self.current_plan = tasks
+        self._update_plan_storage(tasks)
+        
+        # === SAVE NEMOTRON JSON PLAN ===
+        try:
+            plan_path = Path(self.session_manager.current_session_dir) / "nemotron_plan.json"
+            with open(plan_path, 'w', encoding='utf-8') as f:
+                json.dump(tasks, f, indent=2)
+            print(f"[ORCHESTRATOR] Saved Nemotron plan to: {plan_path}")
+        except Exception as e:
+            print(f"[ORCHESTRATOR] Failed to save plan JSON: {e}")
         
         # === VRAM OPTIMIZATION: Unload Orchestrator ===
-        # If we are using Ollama, unload Nemotron to free VRAM for the agents
+        # Unload Nemotron to free VRAM for the agents
         if self.orchestrator_provider_type == 'ollama' and self.config.get('execution.vram_optimized', True):
             if hasattr(self.orchestrator_provider, 'unload_model'):
+                if self.ui:
+                    self.ui.log(f"Unloading Orchestrator ({self.orchestrator_model})...", "INFO")
                 self.orchestrator_provider.unload_model(self.orchestrator_model)
         
-        if self.dashboard:
-            self.dashboard.update_plan(tasks)
-        
+        if self.ui:
+            self.ui.set_plan(tasks)
+            self.ui.log("Plan created, executing...", "INFO")
+
         if not tasks:
             return {"success": False, "error": "No tasks generated"}
+
+        if self._cancelled():
+            return self._cancel_result()
         
         # Phase 3: Create workflow
-        wf_id = self.workflow_engine.create_workflow(tasks, self.current_workflow_id)
+        wf_id = self.workflow_engine.create_workflow(tasks, self.current_workflow_id, pattern_name=pattern_name)
         
-        if self.dashboard:
-            self.dashboard.set_orchestrator_status("Executing Plan")
+        if self.ui:
+            self.ui.log("Executing Plan...", "INFO")
         
         # Phase 4: Execute tasks
         results = []
+        prev_task_id = None
+        prev_output = None
         for i, task in enumerate(tasks, 1):
             print(f"\n{'='*70}")
             print(f"TASK {i}/{len(tasks)}")
             print(f"{'='*70}")
-            
-            result = self.execute_single_task(task)
-            results.append(result)
-            
+
+            if self._cancelled():
+                return self._cancel_result()
+
+            context = {}
+            if prev_task_id and prev_output:
+                context = {
+                    "previous_task_id": prev_task_id,
+                    "previous_task_output": prev_output
+                }
+
+            attempt_context = context.copy()
+            while True:
+                if self._cancelled():
+                    return self._cancel_result()
+                result = self.execute_single_task(task, context=attempt_context)
+                results.append(result)
+
+                if result.get("success"):
+                    prev_task_id = task.get("id")
+                    prev_output = result.get("output")
+                    break
+
+                # Handle failure with recovery strategy
+                if self.ui:
+                    self.ui.update_task_status(task.get("id"), "failed")
+                    self.ui.log(f"Task failed: {result.get('error')}", "ERROR")
+
+                decision = self.error_recovery.handle_failure(task, result.get("error", ""))
+                attempt_context = {
+                    **context,
+                    "previous_error": result.get("error", ""),
+                    "recovery_reason": decision.reason
+                }
+
+                if decision.action == RecoveryAction.RETRY:
+                    if self.ui:
+                        self.ui.log(f"Retrying task {task.get('id')}: {decision.reason}", "WARNING")
+                    continue
+                if decision.action == RecoveryAction.SIMPLIFY_TASK:
+                    hint = decision.params.get("simplification_hints")
+                    if hint:
+                        task["description"] = f"{task.get('description','')}\n\nSimplify: {hint}"
+                    if self.ui:
+                        self.ui.log(f"Simplifying task {task.get('id')} and retrying", "WARNING")
+                    continue
+                if decision.action == RecoveryAction.RETRY_WITH_DIFFERENT_MODEL:
+                    # Fallback to a simpler agent if available
+                    if task.get("assigned_agent") != "simple_qwen":
+                        task["assigned_agent"] = "simple_qwen"
+                    if self.ui:
+                        self.ui.log(f"Retrying with fallback agent for {task.get('id')}", "WARNING")
+                    continue
+
+                if decision.action in (RecoveryAction.ESCALATE_TO_HUMAN, RecoveryAction.ABORT, RecoveryAction.SKIP):
+                    if self.ui:
+                        self.ui.log(f"Stopping task {task.get('id')}: {decision.reason}", "ERROR")
+                    break
+
+                break
+
             # Human checkpoint for critical tasks
             if self.checkpoint.should_checkpoint(task) and result.get("success"):
                 checkpoint_result = self.checkpoint.request_approval(
@@ -1254,12 +2700,6 @@ Do NOT give up. Use the tools and try again!"""
                 if not checkpoint_result.get("approved"):
                     if checkpoint_result.get("abort"):
                         break
-            
-            # Handle failure
-            if not result.get("success"):
-                decision = self.error_recovery.handle_failure(task, result.get("error", ""))
-                if decision.action.value == "abort":
-                    break
         
         total_elapsed = time.time() - total_start
         
@@ -1284,9 +2724,42 @@ Do NOT give up. Use the tools and try again!"""
         print(f"\n{'#'*70}")
         print("ORCHESTRATION COMPLETE")
         print(f"{'#'*70}\n")
+
+        try:
+            self._persist_session_artifacts(user_goal, tasks, results)
+        except Exception:
+            pass
         
-        if self.dashboard:
-            self.dashboard.stop()
+        # === VRAM OPTIMIZATION: Reload Orchestrator ===
+        # Reload Nemotron so it's ready for the next prompt
+        if self.orchestrator_provider_type == 'ollama' and self.config.get('execution.vram_optimized', True):
+            if hasattr(self.orchestrator_provider, 'chat'):
+                if self.ui:
+                    self.ui.log(f"Reloading Orchestrator ({self.orchestrator_model})...", "INFO")
+                # Send dummy request to preload
+                try:
+                    self.orchestrator_provider.chat(
+                        [LLMMessage(role="user", content="ping")], 
+                        self.orchestrator_model,
+                        max_tokens=1
+                    )
+                except:
+                    pass
+
+        if self.ui:
+            self.ui.stop()
+            try:
+                self.ui.trace_event(
+                    "run_complete",
+                    {
+                        "success": successful == len(tasks),
+                        "tasks_total": len(tasks),
+                        "tasks_successful": successful,
+                        "duration_sec": round(total_elapsed, 2),
+                    },
+                )
+            except Exception:
+                pass
         
         return {
             "success": successful == len(tasks),

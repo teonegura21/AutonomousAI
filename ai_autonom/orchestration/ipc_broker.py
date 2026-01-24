@@ -35,7 +35,19 @@ import time
 import threading
 import uuid
 import os
-import fcntl
+try:
+    import fcntl  # POSIX
+    _HAS_FCNTL = True
+except ImportError:
+    fcntl = None
+    _HAS_FCNTL = False
+
+try:
+    import msvcrt  # Windows
+    _HAS_MSVCRT = True
+except ImportError:
+    msvcrt = None
+    _HAS_MSVCRT = False
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable, List, Set
 from dataclasses import dataclass, field, asdict
@@ -117,6 +129,9 @@ class IPCBroker:
         # Subscription registry: channel -> list of callbacks
         self._subscriptions: Dict[str, List[Callable]] = {}
         self._subscription_lock = threading.Lock()
+
+        # Fallback write lock (for platforms without file locking)
+        self._write_lock = threading.Lock()
         
         # Response waiters: correlation_id -> threading.Event
         self._response_waiters: Dict[str, threading.Event] = {}
@@ -156,11 +171,29 @@ class IPCBroker:
         """Context manager for locked write operations."""
         lock_path = str(self.db_path) + ".lock"
         with open(lock_path, 'w') as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
+                if _HAS_FCNTL:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                elif _HAS_MSVCRT:
+                    lock_file.seek(0)
+                    lock_file.write("0")
+                    lock_file.flush()
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    self._write_lock.acquire()
+
                 yield
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                if _HAS_FCNTL:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                elif _HAS_MSVCRT:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        pass
+                else:
+                    if self._write_lock.locked():
+                        self._write_lock.release()
     
     def _init_db(self):
         """Initialize database schema."""

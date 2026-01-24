@@ -1,0 +1,6 @@
+models:
+  orchestrator: huihui_ai/orchestrator-abliterated:latest
+  coder: qwen2.5-coder:7b
+  researcher: deepseek-r1:7b
+  security: qwen2.5-coder:7b
+  reporter: dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0

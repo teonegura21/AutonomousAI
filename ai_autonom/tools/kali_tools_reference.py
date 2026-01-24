@@ -502,10 +502,10 @@ VULNERABILITY_TOOLS = {
 
 ORCHESTRATOR_TOOLS = {
     "scripting": {
-        "python3": {
-            "command": "python3",
+        "python": {
+            "command": "python",
             "description": "Python interpreter",
-            "usage": "python3 script.py",
+            "usage": "python script.py",
             "libraries": ["requests", "pwntools", "scapy", "beautifulsoup4", "pandas"]
         },
         "perl": {

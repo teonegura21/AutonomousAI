@@ -114,8 +114,28 @@ def cmd_run(args):
     
     if result.get("success"):
         print_success("Orchestration completed successfully!")
+        
+        # Notify about full log and artifacts
+        session_id = result.get("workflow_id", "unknown")
+        session_dir = f".runtime/sessions/{session_id}" # Approximation, actual path is managed by SessionManager but typically mapped here or printed above
+        
+        print_info(f"Artifacts generated for this prompt:")
+        print_info(f"  1. Full Execution Log (Thinking + Output): {session_dir}/full_orchestration_log.txt")
+        print_info(f"  2. Nemotron Plan (JSON): {session_dir}/nemotron_plan.json")
+        print_info(f"Agents executed entirely within Kali Linux container.")
     else:
         print_error(f"Orchestration failed: {result.get('error', 'Unknown error')}")
+
+
+def cmd_web(args):
+    """Launch the web UI server"""
+    from multi_agent_framework.ui.web.backend import run
+
+    host = args.host or "127.0.0.1"
+    port = args.port or 8000
+    print_info(f"Starting web UI at http://{host}:{port}")
+    print_info("Start the React UI with: cd multi_agent_framework/ui/web/frontend && npm install && npm run dev")
+    run(host=host, port=port)
 
 
 def cmd_scan_models(args):
@@ -509,6 +529,190 @@ def cmd_interactive(args):
             print(f"Error: {e}")
 
 
+def cmd_simple_tui(args):
+    """Legacy simple TUI (debug only)"""
+    import threading
+    import time
+    import json
+
+    from ai_autonom.orchestration.nemotron_orchestrator import NemotronOrchestrator
+    from ai_autonom.monitoring.simple_tui import get_simple_tui
+    from ai_autonom.monitoring.simple_tui_prompt import get_simple_tui_command
+
+    orchestrator = NemotronOrchestrator(
+        orchestrator_model=args.model,
+        config_path=args.config,
+        enable_checkpoints=args.checkpoints,
+        enable_testing=args.testing,
+        enable_dashboard=False  # Disable rich dashboard
+    )
+
+    tui = get_simple_tui()
+    tui.running = True
+
+    tui.update_goal("Waiting for goal...")
+    tui.set_orchestrator_status("Idle")
+    tui.set_command_result("Type: goal <text> to start")
+
+    run_thread = None
+
+    while True:
+        # Print simple status
+        tui.print_status()
+
+        # If a run is active, check status
+        if run_thread and run_thread.is_alive():
+            time.sleep(1)
+            continue
+        elif run_thread and not run_thread.is_alive():
+            run_thread = None
+            tui.set_orchestrator_status("Idle")
+            tui.set_command_result("Task completed")
+            continue
+
+        # Get command with simple input
+        cmd = get_simple_tui_command()
+
+        if not cmd:
+            continue
+
+        cmd_str = cmd.strip()
+        cmd_lower = cmd_str.lower()
+
+        if cmd_lower.startswith("goal ") or cmd_lower.startswith("start "):
+            goal = cmd_str.split(" ", 1)[1].strip()
+            if not goal:
+                tui.set_command_result("No goal provided")
+                continue
+            tui.update_goal(goal)
+            tui.set_orchestrator_status("Running")
+            run_thread = threading.Thread(target=orchestrator.run, args=(goal,), daemon=True)
+            run_thread.start()
+            tui.set_command_result("Goal started")
+            continue
+
+        if cmd_lower in ("quit", "exit"):
+            if run_thread and run_thread.is_alive():
+                tui.set_command_result("Stop workflow before quitting")
+                continue
+            break
+
+        if cmd_lower == "status":
+            status = orchestrator.get_status()
+            summary = {
+                "orchestrator_model": status.get("orchestrator_model"),
+                "registered_agents": status.get("registered_agents"),
+                "registered_tools": status.get("registered_tools"),
+            }
+            tui.set_command_result(str(summary))
+            continue
+
+        if cmd_lower == "agents":
+            agents = orchestrator.registry.get_all_agents()
+            agent_names = [a.id for a in agents]
+            tui.set_command_result(f"Agents: {', '.join(agent_names[:10])}")
+            continue
+
+        if cmd_lower == "tools":
+            tools = orchestrator.tool_executor.get_available_tools()
+            tui.set_command_result(f"Tools: {len(tools)} available")
+            continue
+
+        tui.set_command_result("Unknown command")
+
+
+def cmd_tui(args):
+    """Legacy full-screen TUI (debug only)"""
+    import threading
+    import time
+    import json
+
+    from ai_autonom.orchestration.nemotron_orchestrator import NemotronOrchestrator
+    from ai_autonom.monitoring.simple_tui import get_simple_tui
+    from ai_autonom.monitoring.simple_tui_prompt import get_simple_tui_command
+
+    orchestrator = NemotronOrchestrator(
+        orchestrator_model=args.model,
+        config_path=args.config,
+        enable_checkpoints=args.checkpoints,
+        enable_testing=args.testing,
+        enable_dashboard=False  # Disable rich dashboard
+    )
+
+    tui = get_simple_tui()
+    tui.running = True
+
+    tui.update_goal("Waiting for goal...")
+    tui.set_orchestrator_status("Idle")
+    tui.set_command_result("Type: goal <text> to start")
+
+    run_thread = None
+
+    while True:
+        # Print simple status
+        tui.print_status()
+
+        # If a run is active, check status
+        if run_thread and run_thread.is_alive():
+            time.sleep(1)
+            continue
+        elif run_thread and not run_thread.is_alive():
+            run_thread = None
+            tui.set_orchestrator_status("Idle")
+            tui.set_command_result("Task completed")
+            continue
+
+        # Get command with simple input
+        cmd = get_simple_tui_command()
+
+        if not cmd:
+            continue
+
+        cmd_str = cmd.strip()
+        cmd_lower = cmd_str.lower()
+
+        if cmd_lower.startswith("goal ") or cmd_lower.startswith("start "):
+            goal = cmd_str.split(" ", 1)[1].strip()
+            if not goal:
+                tui.set_command_result("No goal provided")
+                continue
+            tui.update_goal(goal)
+            tui.set_orchestrator_status("Running")
+            run_thread = threading.Thread(target=orchestrator.run, args=(goal,), daemon=True)
+            run_thread.start()
+            tui.set_command_result("Goal started")
+            continue
+
+        if cmd_lower in ("quit", "exit"):
+            if run_thread and run_thread.is_alive():
+                tui.set_command_result("Stop workflow before quitting")
+                continue
+            break
+
+        if cmd_lower == "status":
+            status = orchestrator.get_status()
+            summary = {
+                "orchestrator_model": status.get("orchestrator_model"),
+                "registered_agents": status.get("registered_agents"),
+                "registered_tools": status.get("registered_tools"),
+            }
+            tui.set_command_result(str(summary))
+            continue
+
+        if cmd_lower == "agents":
+            agents = orchestrator.registry.get_all_agents()
+            agent_names = [a.id for a in agents]
+            tui.set_command_result(f"Agents: {', '.join(agent_names[:10])}")
+            continue
+
+        if cmd_lower == "tools":
+            tools = orchestrator.tool_executor.get_available_tools()
+            tui.set_command_result(f"Tools: {len(tools)} available")
+            continue
+
+        tui.set_command_result("Unknown command")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AI Autonom - Multi-Agent Orchestration System",
@@ -516,9 +720,11 @@ def main():
         epilog="""
 Examples:
   python run_orchestrator.py "Write a Python function to validate emails"
+  python run_orchestrator.py --web                 # Launch web UI
+  python run_orchestrator.py --simple-tui          # Debug-only legacy simple TUI
   python run_orchestrator.py --scan-models --register
   python run_orchestrator.py --list-models
-  python run_orchestrator.py --benchmark qwen3:1.7b
+  python run_orchestrator.py --benchmark qwen2.5-coder:7b
   python run_orchestrator.py --interactive
         """
     )
@@ -526,6 +732,11 @@ Examples:
     # Mode selection
     parser.add_argument("goal", nargs="?", help="Goal to execute")
     parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
+    parser.add_argument("--tui", action="store_true", help="Legacy full-screen TUI (debug only)")
+    parser.add_argument("--simple-tui", action="store_true", help="Legacy simple TUI (debug only)")
+    parser.add_argument("--web", action="store_true", help="Launch web UI server")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Web UI host")
+    parser.add_argument("--port", type=int, default=8000, help="Web UI port")
     
     # Model management
     parser.add_argument("--scan-models", action="store_true", help="Scan for new Ollama models")
@@ -599,13 +810,19 @@ Examples:
             cmd_kali_logs(args)
         elif args.command is not None:  # --kali-exec
             cmd_kali_exec(args)
+        elif args.web:
+            cmd_web(args)
         elif args.interactive:
             cmd_interactive(args)
+        elif args.simple_tui:
+            cmd_simple_tui(args)
+        elif args.tui:
+            cmd_tui(args)
         elif args.goal:
             cmd_run(args)
         else:
-            # Default: interactive mode
-            cmd_interactive(args)
+            # Default: launch web UI
+            cmd_web(args)
             
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.")

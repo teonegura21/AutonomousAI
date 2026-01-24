@@ -34,6 +34,15 @@ class ModelDiscovery:
     def __init__(self, db_path: str = ".runtime/data/agent_registry.db"):
         self.db_path = db_path
         self._ensure_db()
+
+    @staticmethod
+    def is_embedding_model(model_name: str) -> bool:
+        """Heuristic to detect embedding-only models by name."""
+        if not model_name:
+            return False
+        name = model_name.lower()
+        hints = ("embed", "embedding", "bge", "e5", "gte", "mxbai", "instructor", "arctic-embed")
+        return any(hint in name for hint in hints)
     
     def _ensure_db(self):
         """Ensure database and tables exist"""
@@ -81,13 +90,17 @@ class ModelDiscovery:
         
         try:
             response = ollama.list()
-            models = response.get('models', [])
+            if isinstance(response, dict):
+                models = response.get('models', [])
+            else:
+                models = getattr(response, "models", [])
             return [
                 {
-                    'name': m.get('name', ''),
-                    'size': m.get('size', 0),
-                    'modified_at': m.get('modified_at', ''),
-                    'details': m.get('details', {})
+                    'name': (m.get('name') if isinstance(m, dict) else getattr(m, "name", None)) 
+                            or (m.get('model') if isinstance(m, dict) else getattr(m, "model", "")),
+                    'size': m.get('size', 0) if isinstance(m, dict) else getattr(m, "size", 0),
+                    'modified_at': m.get('modified_at', '') if isinstance(m, dict) else getattr(m, "modified_at", ""),
+                    'details': m.get('details', {}) if isinstance(m, dict) else getattr(m, "details", {})
                 }
                 for m in models
             ]
@@ -121,6 +134,113 @@ class ModelDiscovery:
                 new_models.append(model)
         
         return new_models
+
+    def sync_ollama_models(
+        self,
+        auto_register: bool = True,
+        auto_benchmark: bool = False
+    ) -> Dict[str, List[str]]:
+        """
+        Sync Ollama models with local registry.
+        - Registers newly discovered models.
+        - Deactivates models no longer present.
+        """
+        results = {
+            "available": [],
+            "registered": [],
+            "deactivated": [],
+            "failed": []
+        }
+
+        ollama_models = self.scan_ollama_models()
+        available = {m.get("name") for m in ollama_models if m.get("name")}
+        results["available"] = sorted(available)
+
+        registered = set(self.get_registered_models())
+        embedding_models = {m for m in available if self.is_embedding_model(m)}
+
+        # Register new models
+        for model_name in sorted(available - registered):
+            try:
+                if self.is_embedding_model(model_name):
+                    continue
+                if auto_register:
+                    self.auto_register_model(model_name, skip_benchmark=not auto_benchmark)
+                    results["registered"].append(model_name)
+            except Exception as e:
+                print(f"[MODEL_DISCOVERY] Sync register failed for {model_name}: {e}")
+                results["failed"].append(model_name)
+
+        # Deactivate embedding models from registry to avoid agent selection
+        for model_name in sorted(embedding_models & registered):
+            try:
+                if self.deactivate_model(model_name):
+                    results["deactivated"].append(model_name)
+            except Exception as e:
+                print(f"[MODEL_DISCOVERY] Sync deactivate failed for {model_name}: {e}")
+                results["failed"].append(model_name)
+
+        # Deactivate missing models
+        for model_name in sorted(registered - available):
+            try:
+                if self.deactivate_model(model_name):
+                    results["deactivated"].append(model_name)
+            except Exception as e:
+                print(f"[MODEL_DISCOVERY] Sync deactivate failed for {model_name}: {e}")
+                results["failed"].append(model_name)
+
+        return results
+
+    def ensure_models(
+        self,
+        model_names: List[str],
+        auto_register: bool = True,
+        auto_benchmark: bool = True,
+        pull_missing: bool = True
+    ) -> Dict[str, List[str]]:
+        """
+        Ensure a list of Ollama models exists locally; pull missing ones and
+        register capabilities if requested.
+        """
+        results = {
+            "available": [],
+            "pulled": [],
+            "registered": [],
+            "failed": []
+        }
+
+        if not model_names:
+            return results
+
+        ollama = _get_ollama()
+        if not ollama:
+            print("[MODEL_DISCOVERY] Ollama not installed; cannot ensure models")
+            results["failed"].extend(model_names)
+            return results
+
+        existing = {m.get("name") for m in self.scan_ollama_models() if m.get("name")}
+
+        for model_name in model_names:
+            try:
+                if model_name in existing:
+                    results["available"].append(model_name)
+                elif pull_missing:
+                    print(f"[MODEL_DISCOVERY] Pulling Ollama model: {model_name}")
+                    ollama.pull(model_name)
+                    results["pulled"].append(model_name)
+                else:
+                    results["failed"].append(model_name)
+                    continue
+
+                if auto_register:
+                    self.auto_register_model(model_name, skip_benchmark=not auto_benchmark)
+                    results["registered"].append(model_name)
+
+            except Exception as e:
+                print(f"[MODEL_DISCOVERY] Failed to ensure {model_name}: {e}")
+                results["failed"].append(model_name)
+
+        return results
     
     def assess_capabilities(self, model_name: str, timeout: int = 30) -> Dict[str, Any]:
         """

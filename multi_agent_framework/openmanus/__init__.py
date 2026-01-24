@@ -1,0 +1,1 @@
+"""OpenManus vendored package wrapper."""

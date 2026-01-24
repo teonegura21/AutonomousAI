@@ -15,7 +15,11 @@ Tests the complete end-to-end workflow including:
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+# Ensure project root is on path so ai_autonom package imports work
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import time
 from typing import Dict, Any
@@ -74,8 +78,8 @@ class IntegrationTestSuite:
 
 def test_model_discovery():
     """Test dynamic model discovery system"""
-    from core.model_discovery import ModelDiscovery
-    from core.model_selector import DynamicModelSelector
+    from ai_autonom.core.model_discovery import ModelDiscovery
+    from ai_autonom.core.model_selector import DynamicModelSelector
     
     # Test model discovery
     discovery = ModelDiscovery()
@@ -101,7 +105,7 @@ def test_model_discovery():
 
 def test_agent_registry():
     """Test agent registry and factory"""
-    from core.agent_registry import AgentRegistry
+    from ai_autonom.core.agent_registry import AgentRegistry
     
     registry = AgentRegistry()
     agents = registry.get_all_agents()
@@ -117,7 +121,7 @@ def test_agent_registry():
 
 def test_cai_patterns():
     """Test CAI agentic patterns"""
-    from patterns.cai_patterns import PatternLibrary, PatternType, PatternExecutor
+    from ai_autonom.patterns.cai_patterns import PatternLibrary, PatternType, PatternExecutor
     
     library = PatternLibrary()
     
@@ -135,8 +139,8 @@ def test_cai_patterns():
 
 def test_handoff_system():
     """Test handoff manager"""
-    from patterns.handoffs import HandoffManager
-    from patterns.cai_patterns import PatternLibrary
+    from ai_autonom.patterns.handoffs import HandoffManager
+    from ai_autonom.patterns.cai_patterns import PatternLibrary
     
     manager = HandoffManager()
     library = PatternLibrary()
@@ -156,7 +160,7 @@ def test_handoff_system():
 
 def test_task_memory():
     """Test task memory system"""
-    from memory.task_memory import TaskMemory
+    from ai_autonom.memory.task_memory import TaskMemory
     
     memory = TaskMemory()
     
@@ -178,7 +182,7 @@ def test_task_memory():
 
 def test_intent_analyzer():
     """Test intent analyzer"""
-    from orchestration.intent_analyzer import IntentAnalyzer, TaskType
+    from ai_autonom.orchestration.intent_analyzer import IntentAnalyzer, TaskType
     
     analyzer = IntentAnalyzer()
     
@@ -206,7 +210,7 @@ def test_intent_analyzer():
 
 def test_error_recovery():
     """Test error recovery system"""
-    from orchestration.error_recovery import ErrorRecovery, RecoveryAction
+    from ai_autonom.orchestration.error_recovery import ErrorRecovery, RecoveryAction
     
     recovery = ErrorRecovery(max_retries=3)
     
@@ -230,7 +234,7 @@ def test_error_recovery():
 
 def test_human_checkpoint():
     """Test human checkpoint system"""
-    from orchestration.human_checkpoint import (
+    from ai_autonom.orchestration.human_checkpoint import (
         HumanCheckpointManager,
         CheckpointType,
         RiskLevel,
@@ -261,7 +265,7 @@ def test_human_checkpoint():
 
 def test_testing_workflow():
     """Test automated testing workflow"""
-    from orchestration.testing_workflow import TestingWorkflow, TestType
+    from ai_autonom.orchestration.testing_workflow import TestingWorkflow, TestType
     
     workflow = TestingWorkflow()
     
@@ -293,8 +297,8 @@ def add(a, b):
 
 def test_langgraph_workflow():
     """Test LangGraph workflow integration"""
-    from orchestration.langgraph_workflow import MultiAgentWorkflow
-    from patterns.cai_patterns import PatternLibrary
+    from ai_autonom.orchestration.langgraph_workflow import MultiAgentWorkflow
+    from ai_autonom.patterns.cai_patterns import PatternLibrary
     
     workflow = MultiAgentWorkflow()
     library = PatternLibrary()
@@ -311,7 +315,7 @@ def test_langgraph_workflow():
 
 def test_tool_registry():
     """Test tool registry and execution"""
-    from tools.tool_executor import ToolExecutor
+    from ai_autonom.tools.tool_executor import ToolExecutor
     
     executor = ToolExecutor()
     tools = executor.get_available_tools()
@@ -327,7 +331,7 @@ def test_tool_registry():
 
 def test_vector_memory():
     """Test vector memory store"""
-    from memory.vector_store import VectorMemoryStore
+    from ai_autonom.memory.vector_store import VectorMemoryStore
     
     try:
         store = VectorMemoryStore()

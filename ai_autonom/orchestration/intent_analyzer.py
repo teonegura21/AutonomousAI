@@ -409,6 +409,9 @@ class IntentAnalyzer:
                 return "security_pipeline"  # web_pentester -> retester -> report
             else:
                 return "ctf_swarm"  # Decentralized security team
+
+        if task_type == TaskType.RESEARCH:
+            return "research_synth"
         
         # Complex coding with testing -> recursive
         if task_type == TaskType.CODING and complexity in [Complexity.COMPLEX, Complexity.VERY_COMPLEX]:
@@ -430,15 +433,18 @@ class IntentAnalyzer:
         agents = []
         
         if task_type == TaskType.SECURITY_ASSESSMENT:
-            agents.extend(["web_pentester", "retester", "report_agent"])
+            agents.extend(["web_pentester_agent", "retester_agent", "reporting_agent"])
         elif task_type == TaskType.CODING:
             agents.append("coder_qwen")
+            agents.append("synthesizer_agent")
             if entities.get("testing"):
                 agents.append("test_runner")
         elif task_type == TaskType.DOCUMENTATION:
             agents.append("linguistic_dictalm")
         elif task_type == TaskType.TESTING:
             agents.append("test_runner")
+        elif task_type == TaskType.RESEARCH:
+            agents.extend(["research_agent", "synthesizer_agent"])
         else:
             agents.append("coder_qwen")  # Default
         

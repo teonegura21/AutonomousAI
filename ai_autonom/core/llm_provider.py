@@ -23,7 +23,7 @@ class ProviderType(Enum):
 class LLMConfig:
     """Configuration for LLM provider"""
     provider: ProviderType = ProviderType.OLLAMA
-    model: str = "qwen3:1.7b"
+    model: str = "qwen2.5-coder:7b"
     api_key: Optional[str] = None
     api_base: Optional[str] = None  # For custom endpoints
     organization: Optional[str] = None
@@ -57,6 +57,57 @@ class BaseLLMProvider(ABC):
     
     def __init__(self, config: LLMConfig):
         self.config = config
+        
+        # === GUARDRAILS INITIALIZATION ===
+        try:
+            from .guardrails import (
+                validate_command, 
+                detect_injection_patterns,
+                sanitize_external_content,
+                redact_secrets,
+                GuardrailLevel
+            )
+            self.guardrails_active = True
+            # Default to standard level
+            self.guardrails_level = GuardrailLevel.STANDARD
+            print("[LLM_PROVIDER] Guardrails active")
+        except ImportError:
+            self.guardrails_active = False
+            print("[LLM_PROVIDER] Guardrails module not found, protection disabled")
+    
+    def _apply_input_guardrails(self, messages: List[LLMMessage]) -> List[LLMMessage]:
+        """Check user inputs for prompt injection or attacks before sending to LLM"""
+        if not self.guardrails_active:
+            return messages
+            
+        from .guardrails import detect_injection_patterns
+        
+        safe_messages = []
+        for msg in messages:
+            if msg.role == "user":
+                has_injection, result = detect_injection_patterns(msg.content)
+                if has_injection and self.guardrails_level != "off":
+                     print(f"[GUARDRAIL] Blocked prompt injection in input (Confidence: {result.confidence})")
+                     # Replace dangerous content with safety warning
+                     safe_messages.append(LLMMessage(
+                         role="user", 
+                         content="[SECURITY BLOCKED] The previous input contained a potential prompt injection attack and was redacted."
+                     ))
+                     continue
+            
+            safe_messages.append(msg)
+            
+        return safe_messages
+
+    def _apply_output_guardrails(self, content: str) -> str:
+        """Sanitize LLM output (redact secrets, etc.)"""
+        if not self.guardrails_active:
+            return content
+            
+        from .guardrails import redact_secrets
+        # Redact any leaked API keys, passwords, etc
+        clean_content = redact_secrets(content)
+        return clean_content
     
     @abstractmethod
     def chat(
@@ -99,6 +150,7 @@ class OllamaProvider(BaseLLMProvider):
     def __init__(self, config: LLMConfig):
         super().__init__(config)
         self._client = None
+        self._active_model: Optional[str] = None
         self._init_client()
     
     def _init_client(self):
@@ -132,7 +184,24 @@ class OllamaProvider(BaseLLMProvider):
         if not self._client:
             raise RuntimeError("Ollama client not initialized")
         
-        model = model or self.config.model
+        target_model = model or self.config.model
+        self._prepare_model(target_model)
+        
+        # === VRAM OPTIMIZATION: STRICT MODEL UNLOADING ===
+        # Use simple os.system call because we want this to be absolutely reliable
+        # "ollama ps" checks if a model is loaded. 
+        # If a different model is loaded, we unload it by generating a tiny response from the NEW model,
+        # which forces Ollama to swap.
+        
+        # NOTE: A better way with Ollama API is to send keep_alive=0 to unload,
+        # but the simplest way to enforce "only target model" is to rely on Ollama's inner swapping
+        # provided we don't try to parallelize too much.
+        #
+        # For STRICT enforcement as requested:
+        # We can explicitly unload everything else if we had access to the list of loaded models,
+        # but simply calling the new model forces the swap. 
+        # The user wants to "unload the model that is currently loaded".
+        
         msg_dicts = self._messages_to_dict(messages)
         
         options = {
@@ -141,15 +210,34 @@ class OllamaProvider(BaseLLMProvider):
         }
         
         response = self._client.chat(
-            model=model,
+            model=target_model,
             messages=msg_dicts,
             options=options,
             format=kwargs.get("format")
         )
         
+        # Extract thinking process if present (DeepSeek/DictaLM/Qwen-Reasoning style)
+        content = response['message']['content']
+        thinking = ""
+        
+        if "<think>" in content and "</think>" in content:
+            start_idx = content.find("<think>") + 7
+            end_idx = content.find("</think>")
+            if start_idx < end_idx:
+                thinking = content[start_idx:end_idx].strip()
+                # Determine if we want to remove it from content or keep it
+                # Usually we want to present clean content to the user/agent
+                # But for logging we want both.
+                # Let's log the thinking immediately
+                try:
+                    from ..monitoring.debug_logger import log_debug
+                    log_debug(f"MODEL_THINKING ({model})", thinking)
+                except ImportError:
+                    print(f"[{model} THINKING]\n{thinking}\n")
+                    
         return LLMResponse(
             content=response.get("message", {}).get("content", ""),
-            model=model,
+            model=target_model,
             provider="ollama",
             tokens_input=response.get("prompt_eval_count", 0),
             tokens_output=response.get("eval_count", 0),
@@ -167,6 +255,7 @@ class OllamaProvider(BaseLLMProvider):
             raise RuntimeError("Ollama client not initialized")
         
         model = model or self.config.model
+        self._prepare_model(model)
         msg_dicts = self._messages_to_dict(messages)
         
         options = {
@@ -188,19 +277,38 @@ class OllamaProvider(BaseLLMProvider):
     def list_models(self) -> List[str]:
         """List available models"""
         try:
-            response = self.client.list()
+            response = self._client.list()
             return [m['name'] for m in response.get('models', [])]
         except Exception as e:
             print(f"[OLLAMA] List models failed: {e}")
             return []
 
+    def _prepare_model(self, target_model: str) -> None:
+        """Ensure only the target model stays in VRAM."""
+        if not target_model:
+            return
+        if self._active_model and self._active_model != target_model:
+            self.unload_model(self._active_model)
+        if self._active_model != target_model:
+            print(f"[OLLAMA] Switching to model: {target_model}")
+        self._active_model = target_model
+
     def unload_model(self, model_name: str):
         """Force unload a model from VRAM (Ollama specific)"""
+        if not self._client:
+            return
+            
         try:
             print(f"[OLLAMA] Unloading model: {model_name}...")
             # keep_alive=0 tells Ollama to unload immediately
-            self.client.chat(model=model_name, messages=[], keep_alive=0)
+            self._client.chat(
+                model=model_name,
+                messages=[{"role": "user", "content": ""}],
+                keep_alive=0
+            )
             print(f"[OLLAMA] Unloaded {model_name}")
+            if self._active_model == model_name:
+                self._active_model = None
         except Exception as e:
             print(f"[OLLAMA] Failed to unload {model_name}: {e}")
 
@@ -455,7 +563,7 @@ class LLMProviderFactory:
         provider_type = ProviderType(config_dict.get("provider", "ollama"))
         config = LLMConfig(
             provider=provider_type,
-            model=config_dict.get("model", "qwen3:1.7b"),
+            model=config_dict.get("model", "qwen2.5-coder:7b"),
             api_key=config_dict.get("api_key"),
             api_base=config_dict.get("api_base"),
             organization=config_dict.get("organization"),
@@ -536,7 +644,7 @@ def get_provider(
     """Get a configured LLM provider"""
     config = LLMConfig(
         provider=ProviderType(provider_type),
-        model=model or ("gpt-4o-mini" if provider_type == "openai" else "qwen3:1.7b"),
+        model=model or ("gpt-4o-mini" if provider_type == "openai" else "qwen2.5-coder:7b"),
         api_key=api_key,
         api_base=api_base
     )
@@ -551,7 +659,7 @@ if __name__ == "__main__":
     
     # Test Ollama
     print("Testing Ollama provider...")
-    ollama_config = LLMConfig(provider=ProviderType.OLLAMA, model="qwen3:1.7b")
+    ollama_config = LLMConfig(provider=ProviderType.OLLAMA, model="qwen2.5-coder:7b")
     ollama_provider = LLMProviderFactory.create(ollama_config)
     print(f"  Available: {ollama_provider.is_available()}")
     if ollama_provider.is_available():

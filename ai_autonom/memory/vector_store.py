@@ -23,6 +23,17 @@ try:
 except ImportError:
     OLLAMA_AVAILABLE = False
 
+from ai_autonom.core.config import get_config
+
+PREFERRED_EMBEDDING_MODELS = [
+    "nomic-embed-text",
+    "mxbai-embed-large",
+    "bge-small-en",
+    "snowflake-arctic-embed",
+    "all-minilm",
+    "e5-small"
+]
+
 
 class VectorMemoryStore:
     """
@@ -30,21 +41,114 @@ class VectorMemoryStore:
     Stores ALL work: code, decisions, conversations.
     Agents can query: "What coordinate system did we choose?"
     """
+    _embedding_pull_attempted = set()
     
     def __init__(
         self,
-        persist_dir: str = ".runtime/data/chromadb",
-        embedding_model: str = "nomic-embed-text"
+        persist_dir: Optional[str] = None,
+        embedding_model: Optional[str] = None,
+        auto_pull_embeddings: Optional[bool] = None
     ):
+        cfg = get_config()
+        if persist_dir is None:
+            persist_dir = cfg.get("memory.vector_db.persist_directory", ".runtime/data/chromadb")
+        if embedding_model is None:
+            embedding_model = cfg.get("memory.vector_db.embedding_model", "nomic-embed-text")
+        if auto_pull_embeddings is None:
+            auto_pull_embeddings = cfg.get("memory.vector_db.auto_pull_embeddings", False)
+
         self.persist_dir = persist_dir
         self.embedding_model = embedding_model
+        self.auto_pull_embeddings = auto_pull_embeddings
         self.client = None
         self.code_collection = None
         self.decision_collection = None
         self.conversation_collection = None
+        self._force_default_embeddings = set()
         
         if CHROMADB_AVAILABLE:
             self._init_chromadb()
+        self._ensure_embedding_model()
+
+    def _list_ollama_models(self) -> List[str]:
+        """List available Ollama models."""
+        if not OLLAMA_AVAILABLE:
+            return []
+        try:
+            response = ollama.list()
+            if isinstance(response, dict):
+                models = response.get("models", [])
+            else:
+                models = getattr(response, "models", [])
+            names = []
+            for m in models:
+                name = m.get("name") if isinstance(m, dict) else getattr(m, "name", None)
+                if not name:
+                    name = m.get("model") if isinstance(m, dict) else getattr(m, "model", None)
+                if name:
+                    names.append(name)
+            return names
+        except Exception:
+            return []
+
+    def _select_embedding_model(self, available: List[str]) -> Optional[str]:
+        """Select the best available embedding model."""
+        available_set = {m for m in available if m}
+        for name in PREFERRED_EMBEDDING_MODELS:
+            if name in available_set:
+                return name
+            for candidate in available_set:
+                if candidate.startswith(f"{name}:"):
+                    return candidate
+        return sorted(available_set)[0] if available_set else None
+
+    def _pull_embedding_model(self, model_name: str) -> bool:
+        if not model_name or not OLLAMA_AVAILABLE:
+            return False
+        attempted = type(self)._embedding_pull_attempted
+        if model_name in attempted:
+            return False
+        attempted.add(model_name)
+        try:
+            print(f"[VECTOR_STORE] Pulling embedding model: {model_name}")
+            ollama.pull(model_name)
+            return True
+        except Exception as e:
+            print(f"[VECTOR_STORE] Failed to pull embedding model {model_name}: {e}")
+            return False
+
+    def _ensure_embedding_model(self, force_refresh: bool = False) -> None:
+        """Ensure the configured embedding model is available or select a fallback."""
+        if not OLLAMA_AVAILABLE:
+            return
+
+        available = self._list_ollama_models()
+        available_set = {m for m in available if m}
+
+        requested = self.embedding_model
+        if not requested or requested == "auto" or force_refresh:
+            selected = self._select_embedding_model(available)
+            if selected:
+                self.embedding_model = selected
+                return
+            if self.auto_pull_embeddings:
+                default_name = PREFERRED_EMBEDDING_MODELS[0]
+                if self._pull_embedding_model(default_name):
+                    self.embedding_model = default_name
+            return
+
+        if requested not in available_set:
+            for candidate in available_set:
+                if candidate.startswith(f"{requested}:"):
+                    self.embedding_model = candidate
+                    return
+            if self.auto_pull_embeddings and self._pull_embedding_model(requested):
+                self.embedding_model = requested
+                return
+
+            fallback = self._select_embedding_model(available)
+            if fallback:
+                self.embedding_model = fallback
     
     def _init_chromadb(self):
         """Initialize ChromaDB with persistent storage"""
@@ -80,18 +184,76 @@ class VectorMemoryStore:
         except Exception as e:
             print(f"[VECTOR_STORE] Failed to initialize: {e}")
             self.client = None
+
+    def _add_with_optional_embedding(
+        self,
+        collection,
+        doc_id: str,
+        content: str,
+        meta: Dict[str, Any]
+    ) -> bool:
+        if not collection:
+            return False
+
+        use_custom = collection.name not in self._force_default_embeddings
+        embedding = self._get_embedding(content) if use_custom else None
+
+        try:
+            if embedding:
+                collection.add(
+                    ids=[doc_id],
+                    documents=[content],
+                    metadatas=[meta],
+                    embeddings=[embedding]
+                )
+            else:
+                collection.add(
+                    ids=[doc_id],
+                    documents=[content],
+                    metadatas=[meta]
+                )
+            return True
+        except Exception as e:
+            error_text = str(e).lower()
+            if "dimension" in error_text and collection.name not in self._force_default_embeddings:
+                self._force_default_embeddings.add(collection.name)
+                try:
+                    collection.add(
+                        ids=[doc_id],
+                        documents=[content],
+                        metadatas=[meta]
+                    )
+                    return True
+                except Exception as retry_error:
+                    print(f"[VECTOR_STORE] Failed to store content after retry: {retry_error}")
+                    return False
+            print(f"[VECTOR_STORE] Failed to store content: {e}")
+            return False
     
     def _get_embedding(self, text: str) -> Optional[List[float]]:
         """Get embedding from Ollama"""
         if not OLLAMA_AVAILABLE:
             return None
         
-        try:
-            response = ollama.embeddings(model=self.embedding_model, prompt=text[:8000])
-            return response.get("embedding")
-        except Exception as e:
-            print(f"[VECTOR_STORE] Embedding error: {e}")
-            return None
+        if not self.embedding_model or self.embedding_model == "auto":
+            self._ensure_embedding_model()
+
+        for _ in range(2):
+            try:
+                if not self.embedding_model:
+                    return None
+                response = ollama.embeddings(model=self.embedding_model, prompt=text[:8000])
+                if isinstance(response, dict):
+                    return response.get("embedding")
+                return getattr(response, "embedding", None)
+            except Exception as e:
+                error_text = str(e).lower()
+                if "not found" in error_text or "model" in error_text:
+                    self._ensure_embedding_model(force_refresh=True)
+                    continue
+                print(f"[VECTOR_STORE] Embedding error: {e}")
+                return None
+        return None
     
     def store_code(
         self,
@@ -113,25 +275,12 @@ class VectorMemoryStore:
                 **(metadata or {})
             }
             
-            # Get embedding
-            embedding = self._get_embedding(code)
-            
-            if embedding:
-                self.code_collection.add(
-                    ids=[doc_id],
-                    documents=[code],
-                    metadatas=[meta],
-                    embeddings=[embedding]
-                )
-            else:
-                # Add without custom embedding (ChromaDB will generate)
-                self.code_collection.add(
-                    ids=[doc_id],
-                    documents=[code],
-                    metadatas=[meta]
-                )
-            
-            return True
+            return self._add_with_optional_embedding(
+                self.code_collection,
+                doc_id,
+                code,
+                meta
+            )
             
         except Exception as e:
             print(f"[VECTOR_STORE] Failed to store code: {e}")
@@ -151,29 +300,17 @@ class VectorMemoryStore:
             content = f"Decision: {decision}\nRationale: {rationale}"
             doc_id = f"decision_{task_id}_{datetime.now().timestamp()}"
             
-            embedding = self._get_embedding(content)
-            
             meta = {
                 "task_id": task_id,
                 "decision": decision,
                 "timestamp": datetime.now().isoformat()
             }
-            
-            if embedding:
-                self.decision_collection.add(
-                    ids=[doc_id],
-                    documents=[content],
-                    metadatas=[meta],
-                    embeddings=[embedding]
-                )
-            else:
-                self.decision_collection.add(
-                    ids=[doc_id],
-                    documents=[content],
-                    metadatas=[meta]
-                )
-            
-            return True
+            return self._add_with_optional_embedding(
+                self.decision_collection,
+                doc_id,
+                content,
+                meta
+            )
             
         except Exception as e:
             print(f"[VECTOR_STORE] Failed to store decision: {e}")
@@ -189,11 +326,8 @@ class VectorMemoryStore:
         """Store agent conversation/output"""
         if not self.conversation_collection:
             return False
-        
         try:
             doc_id = f"conv_{task_id}_{agent_id}_{datetime.now().timestamp()}"
-            
-            embedding = self._get_embedding(content)
             
             meta = {
                 "task_id": task_id,
@@ -201,26 +335,51 @@ class VectorMemoryStore:
                 "role": role,
                 "timestamp": datetime.now().isoformat()
             }
-            
-            if embedding:
-                self.conversation_collection.add(
-                    ids=[doc_id],
-                    documents=[content],
-                    metadatas=[meta],
-                    embeddings=[embedding]
-                )
-            else:
-                self.conversation_collection.add(
-                    ids=[doc_id],
-                    documents=[content],
-                    metadatas=[meta]
-                )
-            
-            return True
+            return self._add_with_optional_embedding(
+                self.conversation_collection,
+                doc_id,
+                content,
+                meta
+            )
             
         except Exception as e:
             print(f"[VECTOR_STORE] Failed to store conversation: {e}")
             return False
+
+    def store(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        collection: str = "conversations"
+    ) -> bool:
+        """Store arbitrary content in a named collection."""
+        if not self.client:
+            return False
+
+        try:
+            coll = self.client.get_or_create_collection(
+                name=collection,
+                metadata={"description": f"dynamic collection: {collection}"}
+            )
+            doc_id = f"{collection}_{datetime.now().timestamp()}"
+            meta = {
+                "collection": collection,
+                "timestamp": datetime.now().isoformat(),
+                **(metadata or {})
+            }
+            return self._add_with_optional_embedding(coll, doc_id, content, meta)
+        except Exception as e:
+            print(f"[VECTOR_STORE] Failed to store content: {e}")
+            return False
+
+    def query(
+        self,
+        query: str,
+        collection: str = "all",
+        n_results: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Query a collection (or all collections) by meaning."""
+        return self.semantic_search(query, collection=collection, n_results=n_results)
     
     def semantic_search(
         self,
@@ -259,7 +418,8 @@ class VectorMemoryStore:
         
         for coll in search_collections:
             try:
-                if query_embedding:
+                use_custom = coll.name not in self._force_default_embeddings
+                if query_embedding and use_custom:
                     res = coll.query(
                         query_embeddings=[query_embedding],
                         n_results=n_results
@@ -280,6 +440,23 @@ class VectorMemoryStore:
                         })
                         
             except Exception as e:
+                error_text = str(e).lower()
+                if "dimension" in error_text and coll.name not in self._force_default_embeddings:
+                    self._force_default_embeddings.add(coll.name)
+                    try:
+                        res = coll.query(query_texts=[query], n_results=n_results)
+                        if res and res.get("documents"):
+                            for i, doc in enumerate(res["documents"][0]):
+                                results.append({
+                                    "content": doc,
+                                    "metadata": res["metadatas"][0][i] if res.get("metadatas") else {},
+                                    "distance": res["distances"][0][i] if res.get("distances") else None,
+                                    "collection": coll.name
+                                })
+                        continue
+                    except Exception as retry_error:
+                        print(f"[VECTOR_STORE] Search retry failed in {coll.name}: {retry_error}")
+                        continue
                 print(f"[VECTOR_STORE] Search error in {coll.name}: {e}")
         
         # Sort by distance (lower is better)
@@ -391,7 +568,9 @@ class VectorMemoryStore:
         stats = {
             "available": self.client is not None,
             "persist_dir": self.persist_dir,
-            "embedding_model": self.embedding_model
+            "embedding_model": self.embedding_model,
+            "auto_pull_embeddings": self.auto_pull_embeddings,
+            "default_embedding_collections": sorted(self._force_default_embeddings)
         }
         
         if self.client:

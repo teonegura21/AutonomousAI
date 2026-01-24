@@ -10,7 +10,7 @@ DFIR_AGENT = {
     "name": "DFIR Agent",
     "description": """Agent that specializes in Digital Forensics and Incident Response.
                    Expert in investigation and analysis of digital evidence.""",
-    "model": "qwen3:1.7b",
+    "model": "qwen2.5-coder:7b",
     "role": "execution",
     "capabilities": [
         "network_forensics",

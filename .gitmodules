@@ -1,0 +1,9 @@
+[submodule "OpenManus"]
+	path = third_party/OpenManus
+	url = https://github.com/FoundationAgents/OpenManus
+	branch = main
+
+[submodule "opencode"]
+	path = third_party/opencode
+	url = https://github.com/opencode-ai/opencode
+	branch = main

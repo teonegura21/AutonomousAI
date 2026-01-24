@@ -17,8 +17,8 @@ import sqlite3
 
 # Import CAI pattern system
 try:
-    from patterns.cai_patterns import AgenticPattern, PatternExecutor, PatternLibrary
-    from patterns.handoffs import HandoffManager, HandoffContext, HandoffStatus
+    from ai_autonom.patterns.cai_patterns import AgenticPattern, PatternExecutor, PatternLibrary, Pattern, PatternConfig
+    from ai_autonom.patterns.handoffs import HandoffManager, HandoffContext, HandoffStatus
     CAI_PATTERNS_AVAILABLE = True
 except ImportError:
     CAI_PATTERNS_AVAILABLE = False
@@ -200,7 +200,7 @@ class MultiAgentWorkflow:
             self.handoff_manager = HandoffManager(message_bus=message_bus)
             print("[WORKFLOW] CAI pattern support enabled")
         
-        self.current_pattern: Optional[AgenticPattern] = None
+        self.current_pattern: Optional[Pattern] = None
         self.message_bus = message_bus
     
     def create_workflow(
@@ -376,8 +376,9 @@ class MultiAgentWorkflow:
         try:
             pattern_context = self.pattern_executor.execute_pattern(
                 self.current_pattern,
-                state.context,
-                agent_executor
+                task=str(state.context),
+                agents=self.current_pattern.agents if self.current_pattern else [],
+                config=PatternConfig()
             )
             
             # Update final state

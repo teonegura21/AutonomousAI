@@ -2,8 +2,8 @@
 # Multi-Agent Orchestration System
 
 orchestrator:
-  model: "huihui_ai/orchestrator-abliterated"
-  provider: "ollama"  # ollama, openai, azure_openai, openai_compatible
+  model: "huihui_ai/orchestrator-abliterated:latest"
+  provider: "ollama"
   max_decomposition_depth: 3
   enable_human_checkpoints: true
   enable_testing: true
@@ -12,43 +12,29 @@ orchestrator:
 
 # LLM Providers Configuration
 providers:
-  # Default provider to use
   default: "ollama"
-  
-  # Ollama (local)
   ollama:
     enabled: true
     api_base: "http://localhost:11434"
-    default_model: "qwen3:1.7b"
+    default_model: "qwen2.5-coder:7b"
   
-  # OpenAI
   openai:
-    enabled: true
-    api_key: "${OPENAI_API_KEY}"  # Set via environment variable
+    enabled: false
+    api_key: "${OPENAI_API_KEY}"
     default_model: "gpt-4o-mini"
-    organization: ""
     
-  # Azure OpenAI
   azure_openai:
     enabled: false
-    api_key: "${AZURE_OPENAI_API_KEY}"
-    endpoint: "${AZURE_OPENAI_ENDPOINT}"
-    api_version: "2024-02-01"
-    deployment: "gpt-4"
     
-  # OpenAI-compatible (for local servers like LM Studio, vLLM, etc.)
   openai_compatible:
     enabled: false
-    api_base: "http://localhost:8080/v1"
-    api_key: "not-needed"
-    default_model: "local-model"
 
 agents:
   coder:
     id: "coder_qwen"
-    model: "qwen3:1.7b"
-    provider: "ollama"  # Can override per-agent
-    vram_gb: 1.4
+    model: "qwen2.5-coder:7b"
+    provider: "ollama"
+    vram_gb: 5.0
     speed_tokens_sec: 70
     quality_score: 85
   linguistic:
@@ -58,80 +44,51 @@ agents:
     vram_gb: 1.8
     speed_tokens_sec: 50
     quality_score: 80
-  # OpenAI agent example
-  gpt4_coder:
-    id: "gpt4_coder"
-    model: "gpt-4o-mini"
-    provider: "openai"
-    capabilities: ["code_generation", "debugging", "refactoring", "testing"]
-    quality_score: 95
 
 execution:
-  vram_limit_gb: 20
-  max_parallel_agents: 3
+  vram_limit_gb: 24
+  max_parallel_agents: 1
   default_timeout_sec: 300
   max_retries: 3
-  retry_delay_sec: 5
+  max_tool_iterations: 3
+  require_kali_for_security: true
+  vram_optimized: true
+
+ollama_models:
+  auto_pull: false
+  auto_register: true
+  auto_benchmark: false
+  coding_models:
+    - "qwen2.5-coder:7b"
+  linguistic_models:
+    - "dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0"
+  reasoning_models:
+    - "deepseek-r1:7b"
+    - "huihui_ai/orchestrator-abliterated:latest"
 
 memory:
   vector_db:
     type: "chromadb"
     embedding_model: "nomic-embed-text"
-    persist_directory: "./data/chromadb"
+    auto_pull_embeddings: true
+    persist_directory: "./.runtime/data/chromadb"
   structured_db:
     type: "sqlite"
-    path: "./data/agent_registry.db"
-  task_memory:
-    max_entries: 1000
-    context_window: 10
+    path: "./.runtime/data/agent_registry.db"
 
 sandbox:
   enabled: true
   type: "docker"
   image: "python:3.11-slim"
-  mem_limit: "2g"
-  cpu_limit: 2.0
-  network: "bridge"
-  timeout_sec: 60
 
 tools:
   builtin:
     - "filesystem_read"
     - "filesystem_write"
-    - "filesystem_search"
     - "python_exec"
     - "bash_exec"
-    - "pytest_run"
-    - "web_fetch"
-    - "web_search"
   enable_dynamic: true
-  dynamic_tool_dir: "./agent_tools"
-
-model_discovery:
-  enabled: true
-  scan_interval_sec: 60
-  auto_benchmark: true
-  benchmark_timeout_sec: 30
-
-logging:
-  level: "INFO"
-  file: "./logs/orchestrator.log"
-  format: "json"
-  max_size_mb: 10
-  backup_count: 5
-
-checkpoints:
-  enabled: true
-  db_path: "./data/checkpoints.db"
-  auto_save: true
-  save_interval_sec: 30
-
-workflow:
-  enable_langgraph: true
-  checkpoint_db: "./data/workflow_checkpoints.db"
-  enable_parallel: true
 
 monitoring:
   enabled: true
   log_file: "./logs/execution.jsonl"
-  dashboard_port: 8080

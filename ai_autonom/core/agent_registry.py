@@ -6,9 +6,11 @@ Supports multiple LLM providers (Ollama, OpenAI, Azure, etc.)
 """
 
 import sqlite3
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from ai_autonom.core.config import get_config
 
 @dataclass
 class AgentDefinition:
@@ -160,6 +162,14 @@ class AgentRegistry:
         
         conn.commit()
         conn.close()
+
+    def delete_agent(self, agent_id: str) -> None:
+        """Delete an agent from the registry."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+        conn.commit()
+        conn.close()
     
     def find_agent_for_task(self, task_description: str, 
                            required_capabilities: Optional[List[str]] = None,
@@ -273,6 +283,55 @@ class AgentRegistry:
 def setup_initial_registry():
     """Setup registry with current agents and tools"""
     registry = AgentRegistry()
+    config = get_config()
+    
+    # Auto-sync Ollama models and dynamically select role models
+    try:
+        from ai_autonom.core.model_discovery import ModelDiscovery
+        from ai_autonom.core.model_selector import DynamicModelSelector
+
+        discovery = ModelDiscovery()
+        auto_register = config.get('ollama_models.auto_register', True)
+        auto_benchmark = config.get('ollama_models.auto_benchmark', False)
+        sync = discovery.sync_ollama_models(auto_register=auto_register, auto_benchmark=auto_benchmark)
+        available = {m for m in set(sync.get("available", [])) if not discovery.is_embedding_model(m)}
+        if not available:
+            raise RuntimeError("No Ollama models available for dynamic assignment")
+
+        selector = DynamicModelSelector()
+
+        def pick_model(task_type: str, config_key: str, fallback: str) -> str:
+            preferred = config.get(config_key)
+            if preferred and preferred in available:
+                return preferred
+            best = selector.select_best_model(task_type, {"max_vram": config.get("execution.vram_limit_gb", 20)})
+            if isinstance(best, dict) and best.get("model_name") in available:
+                return best["model_name"]
+            if available:
+                return sorted(available)[0]
+            return fallback
+
+        coder_model = pick_model("coding", "agents.coder.model", "qwen2.5-coder:7b")
+        linguistic_model = pick_model("documentation", "agents.linguistic.model", coder_model)
+        orchestrator_model = pick_model("reasoning", "orchestrator.model", coder_model)
+
+        # Persist in-memory config so downstream uses dynamic choices
+        config.set('agents.coder.model', coder_model)
+        config.set('agents.linguistic.model', linguistic_model)
+        config.set('orchestrator.model', orchestrator_model)
+        config.set('providers.ollama.default_model', coder_model)
+
+        # Register per-model dynamic agents
+        capabilities = [
+            c for c in discovery.get_all_capabilities()
+            if not discovery.is_embedding_model(c.get("model_name"))
+        ]
+        _register_dynamic_model_agents(registry, capabilities, available)
+    except Exception as e:
+        print(f"[AGENT_REGISTRY] Dynamic model selection failed: {e}")
+        coder_model = config.get('agents.coder.model', 'qwen2.5-coder:7b')
+        linguistic_model = config.get('agents.linguistic.model', 'dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0')
+        orchestrator_model = config.get('orchestrator.model', 'huihui_ai/orchestrator-abliterated:latest')
     
     # ===== REGISTER AGENTS =====
     
@@ -280,7 +339,7 @@ def setup_initial_registry():
     registry.register_agent(AgentDefinition(
         id="orchestrator_main",
         name="Main Orchestrator",
-        model_name="huihui_ai/orchestrator-abliterated",
+        model_name=orchestrator_model,
         model_size_gb=5.0,
         capabilities=["task_decomposition", "agent_assignment", "planning", "meta_orchestration"],
         tools=["json_output", "agent_registry_query"],
@@ -290,60 +349,160 @@ def setup_initial_registry():
         description="8.2B parameter orchestrator - ONLY plans and assigns, never executes"
     ))
     
-    # Technical/Coding Agent - Qwen3 1.7B
+    # === CAI/SECURITY AGENTS PORT ===
+    try:
+        from ai_autonom.agents.prompt_loader import load_prompt
+        
+        # 1. Red Team Agent (The "Attacker")
+        registry.register_agent(AgentDefinition(
+            id="red_team_agent",
+            name="Red Team Specialist",
+            model_name=coder_model,
+            model_size_gb=4.7,
+            capabilities=["reconnaissance", "exploitation", "privilege_escalation", "network"],
+            tools=["nmap_scan", "shodan_search", "netcat", "generic_linux_command"], # will be expanded by category
+            vram_required=5.0,
+            speed_tokens_per_sec=35.0,
+            quality_score=95.0,
+            description="Specialized in network penetration, lateral movement, and privilege escalation using methodology from CAI.",
+            system_prompt=load_prompt("cai_red_team_agent")
+        ))
+        
+        # 2. Web Pentester Agent (The "Web Expert")
+        registry.register_agent(AgentDefinition(
+            id="web_pentester_agent",
+            name="Web Security Expert",
+            model_name=coder_model,
+            model_size_gb=4.7,
+            capabilities=["web_hacking", "reconnaissance", "js_analysis"],
+            tools=["web_request_framework", "js_surface_mapper", "web_spider", "curl_request"],
+            vram_required=5.0,
+            speed_tokens_per_sec=35.0,
+            quality_score=95.0,
+            description="Expert in Web Application Security, API testing, and JS analysis.",
+            system_prompt=load_prompt("cai_web_pentester")
+        ))
+        
+        # 3. Reporting Agent (The "Scribe")
+        registry.register_agent(AgentDefinition(
+            id="reporting_agent",
+            name="Security Reporter",
+            model_name=linguistic_model,
+            model_size_gb=1.7,
+            capabilities=["reporting", "summarization", "writing"],
+            tools=["record_finding", "filesystem_write", "filesystem_read"],
+            vram_required=2.0,
+            speed_tokens_per_sec=50.0,
+            quality_score=92.0,
+            description="Generates professional security reports and organizes findings.",
+            system_prompt=load_prompt("cai_reporting_agent")
+        ))
+        
+        # 4. Research Agent (OpenManus-style research and synthesis)
+        registry.register_agent(AgentDefinition(
+            id="research_agent",
+            name="Research Agent",
+            model_name=coder_model,
+            model_size_gb=4.7,
+            capabilities=["research", "information_gathering", "summarization"],
+            tools=["web_search", "web_fetch", "filesystem_read", "filesystem_write"],
+            vram_required=5.0,
+            speed_tokens_per_sec=35.0,
+            quality_score=90.0,
+            description="Finds, filters, and summarizes relevant information for downstream agents.",
+            system_prompt=load_prompt("research_agent")
+        ))
+        
+        # 5. Synthesizer Agent (final aggregation)
+        registry.register_agent(AgentDefinition(
+            id="synthesizer_agent",
+            name="Synthesizer Agent",
+            model_name=linguistic_model,
+            model_size_gb=1.8,
+            capabilities=["synthesis", "summarization", "reporting"],
+            tools=["filesystem_read", "filesystem_write"],
+            vram_required=2.0,
+            speed_tokens_per_sec=50.0,
+            quality_score=88.0,
+            description="Aggregates artifacts and outputs into concise deliverables.",
+            system_prompt=load_prompt("synthesizer_agent")
+        ))
+        
+        print(f"[AGENT_REGISTRY] CAI Security Agents registered successfully.")
+        
+    except ImportError:
+        print("[AGENT_REGISTRY] Could not load prompt_loader, skipping CAI agents.")
+    except Exception as e:
+        print(f"[AGENT_REGISTRY] Error registering CAI agents: {e}")
+
+    # Technical/Coding Agent
     registry.register_agent(AgentDefinition(
         id="coder_qwen",
         name="Qwen3 Technical Coder",
-        model_name="qwen3:1.7b",
-        model_size_gb=1.4,
+        model_name=coder_model,
+        model_size_gb=5.0,
         capabilities=["code_generation", "debugging", "testing", "python", "refactoring", "technical_tasks"],
         tools=["filesystem", "python_interpreter", "bash"],
-        vram_required=1.4,
+        vram_required=5.0,
         speed_tokens_per_sec=70.0,
         quality_score=85.0,
-        description="1.7B general purpose model optimized for coding and technical tasks"
+        description=f"Coding agent using {coder_model}"
     ))
     
-    # Linguistic/Simple Tasks Agent - DictaLM 1.7B
+    # Linguistic/Simple Tasks Agent
     registry.register_agent(AgentDefinition(
         id="linguistic_dictalm",
         name="DictaLM Linguistic Agent",
-        model_name="dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0",
+        model_name=linguistic_model,
         model_size_gb=1.8,
         capabilities=["text_generation", "documentation", "summarization", "formatting", "explanation", "simple_tasks"],
         tools=["filesystem"],
         vram_required=1.8,
         speed_tokens_per_sec=50.0,
         quality_score=80.0,
-        description="1.7B thinking model for linguistic tasks, documentation, and explanations"
+        description=f"Linguistic agent using {linguistic_model}"
     ))
     
-    # Simple Tasks Agent - Qwen 1.5B (fast)
+    # Simple Tasks Agent (Fallback to Coder)
     registry.register_agent(AgentDefinition(
         id="simple_qwen",
         name="Qwen Simple Tasks",
-        model_name="qwen2.5:1.5b",
+        model_name=coder_model,
         model_size_gb=1.0,
         capabilities=["simple_tasks", "quick_responses", "formatting"],
         tools=["filesystem"],
         vram_required=1.0,
         speed_tokens_per_sec=80.0,
         quality_score=70.0,
-        description="1.5B model for simple, fast tasks"
+        description="Simple tasks agent"
+    ))
+
+    # Test Runner Agent (alias to coder for test execution)
+    registry.register_agent(AgentDefinition(
+        id="test_runner",
+        name="Test Runner",
+        model_name=coder_model,
+        model_size_gb=1.0,
+        capabilities=["testing", "test_execution", "quality_gates"],
+        tools=["filesystem_read", "filesystem_write", "python_exec", "pytest_run", "bash_exec"],
+        vram_required=2.0,
+        speed_tokens_per_sec=60.0,
+        quality_score=80.0,
+        description="Runs and validates tests, reports results"
     ))
     
-    # DictaLM Coder - For code documentation
+    # DictaLM Coder (Fallback to Linguistic)
     registry.register_agent(AgentDefinition(
         id="coder_dictalm",
         name="DictaLM Coder",
-        model_name="dicta-il/DictaLM-3.0-1.7B-Thinking:q8_0",
+        model_name=linguistic_model,
         model_size_gb=1.8,
         capabilities=["code_documentation", "code_explanation", "readme_generation"],
         tools=["filesystem"],
         vram_required=1.8,
         speed_tokens_per_sec=50.0,
         quality_score=85.0,
-        description="1.7B model for code documentation and explanation"
+        description="Code documentation agent"
     ))
     
     # ===== REGISTER TOOLS =====
@@ -354,6 +513,8 @@ def setup_initial_registry():
         
         cai_agents = get_cai_security_agents()
         for agent in cai_agents:
+            # Override model with configured one
+            agent.model_name = coder_model # Default CAI agents to use the strong coder model
             registry.register_agent(agent)
             
         print(f"[AGENT_REGISTRY] Registered {len(cai_agents)} CAI security agents")
@@ -365,10 +526,17 @@ def setup_initial_registry():
         from ai_autonom.agents.kali_agents import ALL_AGENTS as KALI_AGENTS
         
         for agent_id, agent_def in KALI_AGENTS.items():
+            # Determine appropriate model based on role
+            category = agent_def.get("category", "")
+            if category == "RAPORT":
+                model_to_use = linguistic_model
+            else:
+                model_to_use = coder_model
+
             registry.register_agent(AgentDefinition(
                 id=f"kali_{agent_id}" if not agent_id.startswith("kali_") else agent_id,
                 name=agent_def.get("name", agent_id),
-                model_name=agent_def.get("model", "qwen3:1.7b"),
+                model_name=model_to_use,
                 model_size_gb=agent_def.get("vram_required", 1.8),
                 capabilities=agent_def.get("capabilities", []) + ["kali_linux", "container_execution"],
                 tools=agent_def.get("tools", []) + agent_def.get("kali_tools", []),
@@ -558,6 +726,77 @@ def setup_initial_registry():
     ))
     
     return registry
+
+
+def _infer_model_role(cap: Dict[str, Any]) -> str:
+    """Infer a general role based on capability scores."""
+    scores = {
+        "coding": cap.get("coding_score", 0.0),
+        "reasoning": cap.get("reasoning_score", 0.0),
+        "documentation": cap.get("documentation_score", 0.0),
+    }
+    # Speed-focused if clearly high
+    speed = cap.get("speed_tokens_sec", 0.0)
+    if speed >= 80:
+        return "fast"
+    return max(scores, key=scores.get)
+
+
+def _sanitize_model_id(model_name: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", model_name.lower()).strip("_")
+
+
+def _register_dynamic_model_agents(
+    registry: AgentRegistry,
+    capabilities: List[Dict[str, Any]],
+    available_models: Optional[set] = None
+) -> None:
+    """Register one generic agent per available model with an inferred role."""
+    available_models = available_models or {c.get("model_name") for c in capabilities}
+    allowed_ids = {f"ollama_{_sanitize_model_id(name)}" for name in available_models if name}
+
+    # Clean up stale dynamic agents
+    for agent in registry.get_all_agents():
+        if agent.id.startswith("ollama_") and agent.id not in allowed_ids:
+            registry.delete_agent(agent.id)
+
+    role_capabilities = {
+        "coding": ["code_generation", "debugging", "testing", "refactoring", "python", "technical_tasks"],
+        "reasoning": ["planning", "analysis", "task_decomposition"],
+        "documentation": ["documentation", "summarization", "text_generation", "formatting", "explanation"],
+        "fast": ["simple_tasks", "quick_responses", "formatting"]
+    }
+    role_tools = {
+        "coding": ["filesystem_read", "filesystem_write", "python_exec", "bash_exec", "pytest_run"],
+        "reasoning": ["filesystem_read"],
+        "documentation": ["filesystem_read", "filesystem_write"],
+        "fast": ["filesystem_read"]
+    }
+
+    for cap in capabilities:
+        model_name = cap.get("model_name")
+        if not model_name or model_name not in available_models:
+            continue
+
+        role = _infer_model_role(cap)
+        agent_id = f"ollama_{_sanitize_model_id(model_name)}"
+        registry.register_agent(AgentDefinition(
+            id=agent_id,
+            name=f"Ollama {model_name}",
+            model_name=model_name,
+            model_size_gb=cap.get("vram_gb", 0.0),
+            capabilities=role_capabilities.get(role, []),
+            tools=role_tools.get(role, []),
+            vram_required=cap.get("vram_gb", 0.0),
+            speed_tokens_per_sec=cap.get("speed_tokens_sec", 0.0),
+            quality_score=max(
+                cap.get("coding_score", 0.0),
+                cap.get("reasoning_score", 0.0),
+                cap.get("documentation_score", 0.0)
+            ),
+            description=f"Auto role '{role}' for {model_name}",
+            provider="ollama"
+        ))
 
 
 if __name__ == "__main__":

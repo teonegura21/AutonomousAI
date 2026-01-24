@@ -1,1 +1,0 @@
-ca_i_nmap_scan -sP 192.168.1.0/24 --top-10 -v

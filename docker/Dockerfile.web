@@ -1,83 +1,29 @@
-# Web Tools Container
-# For web scraping, API testing, and browser automation
+# Web Tools Container (Lightweight)
+# Minimal Ubuntu base - tools installed on demand
 
-FROM python:3.11-slim
+FROM ubuntu:24.04
 
 LABEL maintainer="AI_Autonom"
 LABEL description="Web tools sandbox for scraping and API testing"
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
-ENV PLAYWRIGHT_BROWSERS_PATH=/browsers
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
+# Install minimal runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    wget \
+    python3 \
+    python3-venv \
+    python3-pip \
+    python-is-python3 \
     ca-certificates \
-    chromium \
-    chromium-driver \
-    firefox-esr \
-    fonts-liberation \
-    libnss3 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    jq \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python web packages
-RUN pip install --no-cache-dir \
-    # HTTP clients
-    requests \
-    httpx \
-    aiohttp \
-    urllib3 \
-    # Web scraping
-    beautifulsoup4 \
-    lxml \
-    selectolax \
-    parsel \
-    # Browser automation
-    selenium \
-    playwright \
-    pyppeteer \
-    # API testing
-    pytest \
-    pytest-asyncio \
-    respx \
-    # HTML parsing
-    html5lib \
-    cssselect \
-    # JSON/XML
-    pyyaml \
-    xmltodict \
-    # Rate limiting
-    ratelimit \
-    tenacity \
-    # Utilities
-    fake-useragent \
-    python-dotenv \
-    rich \
-    tqdm
-
-# Install playwright browsers
-RUN playwright install chromium firefox
-
 WORKDIR /web
-RUN useradd -m -s /bin/bash -u 1000 webuser && \
-    chown -R webuser:webuser /web /browsers
+RUN if ! getent passwd 1000 >/dev/null; then \
+        useradd -m -s /bin/bash -u 1000 webuser; \
+    fi && \
+    chown -R 1000:1000 /web
 
-USER webuser
+USER 1000:1000
 
 CMD ["bash"]
